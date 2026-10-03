@@ -2,9 +2,14 @@
 __pycache__/
 *.pyc
 .env
+.venv/
 venv/
 .DS_Store
 
 ca.pem
 
-.env
+.vscode/
+.idea/
+
+*.pyo
+
