@@ -603,11 +603,15 @@ def run_oltp_etl():
                 flights_df["delay_minutes"]
             ),
 
+            "arrival_delay_minutes": 0,
+
             "flight_duration_minutes": (
                 flights_df[
                     "flight_duration_minutes"
                 ]
             ),
+
+            "distance_km": None,
 
             "passenger_count": (
                 flights_df["passenger_count"]
@@ -615,7 +619,9 @@ def run_oltp_etl():
 
             "cancelled_flag": (
                 flights_df["cancelled_flag"]
-            )
+            ),
+
+            "diverted_flag": False
         })
 
         # =====================================================

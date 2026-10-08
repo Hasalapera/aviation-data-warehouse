@@ -111,11 +111,17 @@ CREATE TABLE IF NOT EXISTS fact_flight (
 
     delay_minutes INT DEFAULT 0,
 
+    arrival_delay_minutes INT DEFAULT 0,
+
     flight_duration_minutes INT,
+
+    distance_km DECIMAL(8,2),
 
     passenger_count INT,
 
     cancelled_flag BOOLEAN DEFAULT FALSE,
+
+    diverted_flag BOOLEAN DEFAULT FALSE,
 
     CONSTRAINT fk_fact_date
         FOREIGN KEY (date_key)
