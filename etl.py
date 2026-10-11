@@ -528,13 +528,26 @@ def run_etl():
                 df["departure_delay_minutes"],
                 errors="coerce"
             ).fillna(0).astype(int),
+            "arrival_delay_minutes": pd.to_numeric(
+                df["arrival_delay_minutes"],
+                errors="coerce"
+            ).fillna(0).astype(int),
             "flight_duration_minutes": pd.to_numeric(
                 df["flight_duration_minutes"],
                 errors="coerce"
             ).fillna(0).astype(int),
+            "distance_km": pd.to_numeric(
+                df["distance_km"],
+                errors="coerce"
+            ),
             "passenger_count": None,
             "cancelled_flag": (
                 df["cancelled_flag"]
+                .fillna(False)
+                .astype(bool)
+            ),
+            "diverted_flag": (
+                df["diverted_flag"]
                 .fillna(False)
                 .astype(bool)
             )
