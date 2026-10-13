@@ -29,7 +29,7 @@ ORDER BY
 # Q17 - Average Delay by Day of Week
 QUERY_DELAY_BY_WEEKDAY = """
 SELECT
-    d.day_of_week,
+    WEEKDAY(d.full_date) + 1 AS day_of_week,
     d.day_name,
     COUNT(f.flight_key) AS total_flights,
     ROUND(AVG(f.delay_minutes), 2) AS avg_delay_mins
@@ -37,9 +37,9 @@ FROM fact_flight f
 JOIN dim_date d
     ON f.date_key = d.date_key
 GROUP BY
-    d.day_of_week,
+    WEEKDAY(d.full_date) + 1,
     d.day_name
-ORDER BY d.day_of_week;
+ORDER BY day_of_week;
 """
 
 
@@ -81,6 +81,7 @@ SELECT
     END AS time_bucket,
     COUNT(f.flight_key) AS total_flights
 FROM fact_flight f
+WHERE f.scheduled_departure IS NOT NULL
 GROUP BY
     CASE
         WHEN HOUR(f.scheduled_departure) < 6 THEN '00-06'
@@ -97,7 +98,7 @@ QUERY_MONTH_WEEKDAY_DELAY = """
 SELECT
     d.month,
     d.month_name,
-    d.day_of_week,
+    WEEKDAY(d.full_date) + 1 AS day_of_week,
     d.day_name,
     ROUND(AVG(f.delay_minutes), 2) AS avg_delay_mins
 FROM fact_flight f
@@ -106,11 +107,11 @@ JOIN dim_date d
 GROUP BY
     d.month,
     d.month_name,
-    d.day_of_week,
+    WEEKDAY(d.full_date) + 1,
     d.day_name
 ORDER BY
     d.month,
-    d.day_of_week;
+    day_of_week;
 """
 
 

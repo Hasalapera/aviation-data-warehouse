@@ -577,6 +577,10 @@ def run_oltp_etl():
         )
 
         fact_records = pd.DataFrame({
+            "source_system": "oltp",
+
+            "source_flight_id": flights_df["flight_id"].astype(str),
+
             "date_key": flights_df["date_key"],
 
             "airline_key": flights_df["airline_key"],
@@ -586,6 +590,11 @@ def run_oltp_etl():
             "weather_key": flights_df["weather_key"],
 
             "flight_number": flights_df["flight_number"],
+
+            "scheduled_departure": pd.to_datetime(
+                flights_df["scheduled_departure"],
+                errors="coerce"
+            ),
 
             "departure_time": pd.to_datetime(
                 flights_df["actual_departure"],
@@ -626,35 +635,48 @@ def run_oltp_etl():
 
         # =====================================================
         # 4. DUPLICATE PROTECTION
+        #    (idempotent by source identity, never by flight_number)
         # =====================================================
 
         print(
-            "\n5. Checking existing flight numbers..."
+            "\n5. Checking existing source identities..."
         )
 
-        existing_flights = pd.read_sql(
+        existing_sources = pd.read_sql(
             text("""
-                SELECT flight_number
+                SELECT source_system, source_flight_id
                 FROM fact_flight
+                WHERE source_flight_id IS NOT NULL
             """),
             dw_conn
         )
 
-        existing_flights["flight_number"] = (
-            existing_flights["flight_number"]
-            .astype(str)
-            .str.strip()
+        existing_keys = set(
+            zip(
+                existing_sources["source_system"].astype(str),
+                existing_sources["source_flight_id"].astype(str)
+            )
         )
-
-        # -----------------------------------------------------
-        # Remove flights already in DW
-        # -----------------------------------------------------
 
         before_count = len(fact_records)
 
+        # The OLTP flight_id is the row identity; distinct source flights
+        # that share a flight_number or date must be preserved.
+        fact_records = (
+            fact_records
+            .drop_duplicates(
+                subset=["source_system", "source_flight_id"]
+            )
+            .copy()
+        )
+
         fact_records = fact_records[
-            ~fact_records["flight_number"].isin(
-                existing_flights["flight_number"]
+            ~fact_records.apply(
+                lambda row: (
+                    str(row["source_system"]),
+                    str(row["source_flight_id"])
+                ) in existing_keys,
+                axis=1
             )
         ].copy()
 
@@ -663,31 +685,8 @@ def run_oltp_etl():
         )
 
         print(
-            f" -> Existing OLTP flights skipped: "
+            f" -> Existing OLTP source records skipped: "
             f"{skipped_existing}"
-        )
-
-        # -----------------------------------------------------
-        # Remove duplicate flight numbers inside OLTP
-        # -----------------------------------------------------
-
-        before_internal = len(fact_records)
-
-        fact_records = (
-            fact_records
-            .drop_duplicates(
-                subset=["flight_number"]
-            )
-            .copy()
-        )
-
-        skipped_internal = (
-            before_internal - len(fact_records)
-        )
-
-        print(
-            f" -> Duplicate OLTP flight numbers "
-            f"skipped: {skipped_internal}"
         )
 
         # =====================================================

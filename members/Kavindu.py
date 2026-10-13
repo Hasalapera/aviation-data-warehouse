@@ -13,8 +13,10 @@ SELECT
     a.airport_name,
     COUNT(f.flight_key) AS departure_flights
 FROM fact_flight f
+JOIN dim_route r
+    ON f.route_key = r.route_key
 JOIN dim_airport a
-    ON f.origin_airport_key = a.airport_key
+    ON r.origin_airport_key = a.airport_key
 GROUP BY
     a.airport_code,
     a.airport_name
@@ -26,15 +28,19 @@ LIMIT 10;
 # Q7 - Busiest Routes by Flight Count
 QUERY_BUSIEST_ROUTES = """
 SELECT
-    r.origin_airport_code,
-    r.destination_airport_code,
+    o.airport_code AS origin_airport_code,
+    d.airport_code AS destination_airport_code,
     COUNT(f.flight_key) AS total_flights
 FROM fact_flight f
 JOIN dim_route r
     ON f.route_key = r.route_key
+JOIN dim_airport o
+    ON r.origin_airport_key = o.airport_key
+JOIN dim_airport d
+    ON r.destination_airport_key = d.airport_key
 GROUP BY
-    r.origin_airport_code,
-    r.destination_airport_code
+    o.airport_code,
+    d.airport_code
 ORDER BY total_flights DESC
 LIMIT 10;
 """
@@ -43,16 +49,20 @@ LIMIT 10;
 # Q8 - Worst Routes by Average Delay
 QUERY_WORST_ROUTES_DELAY = """
 SELECT
-    r.origin_airport_code,
-    r.destination_airport_code,
+    o.airport_code AS origin_airport_code,
+    d.airport_code AS destination_airport_code,
     COUNT(f.flight_key) AS total_flights,
     ROUND(AVG(f.delay_minutes), 2) AS avg_delay_mins
 FROM fact_flight f
 JOIN dim_route r
     ON f.route_key = r.route_key
+JOIN dim_airport o
+    ON r.origin_airport_key = o.airport_key
+JOIN dim_airport d
+    ON r.destination_airport_key = d.airport_key
 GROUP BY
-    r.origin_airport_code,
-    r.destination_airport_code
+    o.airport_code,
+    d.airport_code
 HAVING COUNT(f.flight_key) >= 5
 ORDER BY avg_delay_mins DESC
 LIMIT 15;
@@ -65,17 +75,19 @@ SELECT
     a.airport_code,
     a.airport_name,
     COUNT(DISTINCT CASE
-        WHEN f.origin_airport_key = a.airport_key
+        WHEN r.origin_airport_key = a.airport_key
         THEN f.flight_key
     END) AS departures,
     COUNT(DISTINCT CASE
-        WHEN f.destination_airport_key = a.airport_key
+        WHEN r.destination_airport_key = a.airport_key
         THEN f.flight_key
     END) AS arrivals
 FROM dim_airport a
+LEFT JOIN dim_route r
+    ON r.origin_airport_key = a.airport_key
+    OR r.destination_airport_key = a.airport_key
 LEFT JOIN fact_flight f
-    ON f.origin_airport_key = a.airport_key
-    OR f.destination_airport_key = a.airport_key
+    ON f.route_key = r.route_key
 GROUP BY
     a.airport_code,
     a.airport_name
@@ -86,8 +98,8 @@ ORDER BY (departures + arrivals) DESC;
 # Q10 - Cancellations by Route
 QUERY_CANCELLATIONS_BY_ROUTE = """
 SELECT
-    r.origin_airport_code,
-    r.destination_airport_code,
+    o.airport_code AS origin_airport_code,
+    d.airport_code AS destination_airport_code,
     COUNT(f.flight_key) AS total_flights,
     SUM(CASE
         WHEN f.cancelled_flag = 1 THEN 1
@@ -96,9 +108,13 @@ SELECT
 FROM fact_flight f
 JOIN dim_route r
     ON f.route_key = r.route_key
+JOIN dim_airport o
+    ON r.origin_airport_key = o.airport_key
+JOIN dim_airport d
+    ON r.destination_airport_key = d.airport_key
 GROUP BY
-    r.origin_airport_code,
-    r.destination_airport_code
+    o.airport_code,
+    d.airport_code
 ORDER BY cancelled_flights DESC
 LIMIT 10;
 """
