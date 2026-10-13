@@ -99,6 +99,9 @@ CREATE TABLE IF NOT EXISTS fact_flight (
 
     flight_key BIGINT AUTO_INCREMENT PRIMARY KEY,
 
+    source_system VARCHAR(20),
+    source_flight_id VARCHAR(50),
+
     date_key INT NOT NULL,
     airline_key INT NOT NULL,
     route_key INT NOT NULL,
@@ -106,6 +109,7 @@ CREATE TABLE IF NOT EXISTS fact_flight (
 
     flight_number VARCHAR(20),
 
+    scheduled_departure DATETIME,
     departure_time DATETIME,
     arrival_time DATETIME,
 
@@ -139,7 +143,11 @@ CREATE TABLE IF NOT EXISTS fact_flight (
         FOREIGN KEY (weather_key)
         REFERENCES dim_weather(weather_key),
 
+    CONSTRAINT uq_fact_source
+        UNIQUE (source_system, source_flight_id),
+
     INDEX idx_fact_flight_number (flight_number),
+    INDEX idx_fact_scheduled_departure (scheduled_departure),
     INDEX idx_fact_date (date_key),
     INDEX idx_fact_airline (airline_key),
     INDEX idx_fact_route (route_key)
