@@ -49,16 +49,20 @@ ORDER BY total_passengers DESC;
 # Q23 - Top Routes by Passenger Demand
 QUERY_TOP_ROUTES_PASSENGERS = """
 SELECT
-    r.origin_airport_code,
-    r.destination_airport_code,
+    o.airport_code AS origin_airport_code,
+    d.airport_code AS destination_airport_code,
     COALESCE(SUM(f.passenger_count), 0) AS total_passengers,
     COUNT(f.flight_key) AS total_flights
 FROM fact_flight f
 JOIN dim_route r
     ON f.route_key = r.route_key
+JOIN dim_airport o
+    ON r.origin_airport_key = o.airport_key
+JOIN dim_airport d
+    ON r.destination_airport_key = d.airport_key
 GROUP BY
-    r.origin_airport_code,
-    r.destination_airport_code
+    o.airport_code,
+    d.airport_code
 ORDER BY total_passengers DESC
 LIMIT 10;
 """

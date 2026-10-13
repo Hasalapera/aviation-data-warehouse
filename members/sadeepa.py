@@ -47,14 +47,14 @@ ORDER BY cancellation_rate_pct DESC;
 # Q13 - Rainfall vs Departure Delay
 QUERY_RAINFALL_VS_DELAY = """
 SELECT
-    w.rainfall_mm,
+    w.rainfall AS rainfall_mm,
     ROUND(AVG(f.delay_minutes), 2) AS avg_delay_mins,
     COUNT(f.flight_key) AS total_flights
 FROM fact_flight f
 JOIN dim_weather w
     ON f.weather_key = w.weather_key
-GROUP BY w.rainfall_mm
-ORDER BY w.rainfall_mm;
+GROUP BY w.rainfall
+ORDER BY w.rainfall;
 """
 
 
@@ -62,8 +62,8 @@ ORDER BY w.rainfall_mm;
 QUERY_VISIBILITY_VS_DELAY = """
 SELECT
     CASE
-        WHEN w.visibility_km < 2 THEN 'Low'
-        WHEN w.visibility_km < 5 THEN 'Medium'
+        WHEN w.visibility < 2 THEN 'Low'
+        WHEN w.visibility < 5 THEN 'Medium'
         ELSE 'High'
     END AS visibility_level,
     COUNT(f.flight_key) AS total_flights,
@@ -73,8 +73,8 @@ JOIN dim_weather w
     ON f.weather_key = w.weather_key
 GROUP BY
     CASE
-        WHEN w.visibility_km < 2 THEN 'Low'
-        WHEN w.visibility_km < 5 THEN 'Medium'
+        WHEN w.visibility < 2 THEN 'Low'
+        WHEN w.visibility < 5 THEN 'Medium'
         ELSE 'High'
     END
 ORDER BY avg_delay_mins DESC;
@@ -84,14 +84,14 @@ ORDER BY avg_delay_mins DESC;
 # Q15 - Temperature vs Flight Delay
 QUERY_TEMPERATURE_VS_DELAY = """
 SELECT
-    w.temperature_c,
+    w.temperature AS temperature_c,
     ROUND(AVG(f.delay_minutes), 2) AS avg_delay_mins,
     COUNT(f.flight_key) AS flight_volume
 FROM fact_flight f
 JOIN dim_weather w
     ON f.weather_key = w.weather_key
-GROUP BY w.temperature_c
-ORDER BY w.temperature_c;
+GROUP BY w.temperature
+ORDER BY w.temperature;
 """
 
 
