@@ -16,7 +16,8 @@ def run_master_pipeline():
             "CSV ETL",
         ),
         (
-            "[2/3] Ingesting Live Open-Meteo Weather API Data...",
+            "[2/3] Ingesting Historical Weather "
+            "(Open-Meteo Archive + NOAA METAR)...",
             run_weather_etl,
             "Weather ETL",
         ),

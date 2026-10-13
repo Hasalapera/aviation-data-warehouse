@@ -196,6 +196,101 @@ def migrate_schema():
     print("=" * 70 + "\n")
 
 
+def migrate_weather_schema():
+    """Additive, idempotent migration for historical weather identity.
+
+    Existing dim_weather rows (CSV-derived and legacy) keep their surrogate
+    ``weather_key`` and receive NULL for every new column, so the unique key
+    and foreign key never conflict with legacy data.
+    """
+
+    print("\n" + "=" * 70)
+    print(" WEATHER SCHEMA MIGRATION (additive, idempotent)")
+    print("=" * 70)
+
+    conn = _connect()
+    try:
+        adds = []
+
+        weather_columns = [
+            ("airport_key", "ADD COLUMN airport_key INT NULL"),
+            ("observation_time", "ADD COLUMN observation_time DATETIME NULL"),
+            ("relative_humidity", "ADD COLUMN relative_humidity DECIMAL(5,2) NULL"),
+            ("cloud_cover", "ADD COLUMN cloud_cover DECIMAL(5,2) NULL"),
+            ("weather_code", "ADD COLUMN weather_code SMALLINT NULL"),
+            ("visibility_source", "ADD COLUMN visibility_source VARCHAR(50) NULL"),
+            ("source_dataset", "ADD COLUMN source_dataset VARCHAR(50) NULL"),
+            ("source_model", "ADD COLUMN source_model VARCHAR(50) NULL"),
+            ("source_timezone", "ADD COLUMN source_timezone VARCHAR(50) NULL"),
+        ]
+
+        for column, ddl in weather_columns:
+            if not _column_exists(conn, "dim_weather", column):
+                adds.append(ddl)
+
+        if adds:
+            with conn.cursor() as cur:
+                cur.execute("ALTER TABLE dim_weather " + ", ".join(adds))
+            print(f" -> Added columns: {len(adds)}")
+        else:
+            print(" -> Columns already present.")
+
+        if not _index_exists(
+            conn, "dim_weather", "idx_weather_airport_time"
+        ):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    ALTER TABLE dim_weather
+                    ADD INDEX idx_weather_airport_time
+                    (airport_key, observation_time)
+                    """
+                )
+            print(" -> Added index idx_weather_airport_time.")
+        else:
+            print(" -> Index already present.")
+
+        if not _constraint_exists(
+            conn, "dim_weather", "uq_weather_airport_time"
+        ):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    ALTER TABLE dim_weather
+                    ADD CONSTRAINT uq_weather_airport_time
+                    UNIQUE (
+                        airport_key, observation_time,
+                        source_dataset, source_model
+                    )
+                    """
+                )
+            print(" -> Added unique constraint uq_weather_airport_time.")
+        else:
+            print(" -> Unique constraint already present.")
+
+        if not _constraint_exists(
+            conn, "dim_weather", "fk_weather_airport"
+        ):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    ALTER TABLE dim_weather
+                    ADD CONSTRAINT fk_weather_airport
+                    FOREIGN KEY (airport_key)
+                    REFERENCES dim_airport (airport_key)
+                    """
+                )
+            print(" -> Added foreign key fk_weather_airport.")
+        else:
+            print(" -> Foreign key already present.")
+
+    finally:
+        conn.close()
+
+    print(" WEATHER SCHEMA MIGRATION COMPLETE")
+    print("=" * 70 + "\n")
+
+
 # =========================================================
 # BACKUPS (external dump + in-database snapshot)
 # =========================================================
@@ -249,34 +344,37 @@ def create_backups():
     if size == 0:
         raise RuntimeError("mysqldump produced an empty file.")
 
-    snapshot = f"fact_flight_backup_{ts}"
-
     conn = _connect()
+    snapshots = {}
     try:
-        with conn.cursor() as cur:
-            cur.execute(f"DROP TABLE IF EXISTS {snapshot}")
-            cur.execute(f"CREATE TABLE {snapshot} LIKE fact_flight")
-            cur.execute(
-                f"INSERT INTO {snapshot} SELECT * FROM fact_flight"
-            )
-            cur.execute(f"SELECT COUNT(*) FROM {snapshot}")
-            snap_count = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM fact_flight")
-            fact_count = cur.fetchone()[0]
+        for table in ("fact_flight", "dim_weather"):
+            snapshot = f"{table}_backup_{ts}"
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {snapshot}")
+                cur.execute(f"CREATE TABLE {snapshot} LIKE {table}")
+                cur.execute(
+                    f"INSERT INTO {snapshot} SELECT * FROM {table}"
+                )
+                cur.execute(f"SELECT COUNT(*) FROM {snapshot}")
+                snap_count = cur.fetchone()[0]
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                source_count = cur.fetchone()[0]
+            if snap_count != source_count:
+                raise RuntimeError(
+                    f"Snapshot row mismatch for {table}: "
+                    f"{snap_count} != {source_count}"
+                )
+            snapshots[table] = snapshot
     finally:
         conn.close()
 
-    if snap_count != fact_count:
-        raise RuntimeError(
-            f"Snapshot row mismatch: {snap_count} != {fact_count}"
-        )
-
     print(f" -> External dump : {dump_path} ({size} bytes)")
-    print(f" -> Snapshot table: {snapshot} ({snap_count} rows)")
+    for table, snapshot in snapshots.items():
+        print(f" -> Snapshot table: {snapshot}")
     print(" BACKUP COMPLETE")
     print("=" * 70 + "\n")
 
-    return dump_path, snapshot
+    return dump_path, snapshots
 
 
 # =========================================================
@@ -673,6 +771,8 @@ if __name__ == "__main__":
 
     if mode == "migrate":
         migrate_schema()
+    elif mode == "migrate-weather":
+        migrate_weather_schema()
     elif mode == "backup":
         create_backups()
     elif mode == "repair":

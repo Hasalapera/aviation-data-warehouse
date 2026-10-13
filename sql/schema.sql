@@ -83,11 +83,41 @@ CREATE TABLE IF NOT EXISTS dim_route (
 CREATE TABLE IF NOT EXISTS dim_weather (
     weather_key INT PRIMARY KEY AUTO_INCREMENT,
 
+    -- Historical weather identity (NULL for legacy/CSV-derived rows)
+    airport_key INT,
+    observation_time DATETIME,
+
     temperature DECIMAL(5,2),
     rainfall DECIMAL(6,2),
     wind_speed DECIMAL(6,2),
     visibility DECIMAL(6,2),
-    weather_condition VARCHAR(50)
+    weather_condition VARCHAR(50),
+
+    -- Additional reanalysis fields
+    relative_humidity DECIMAL(5,2),
+    cloud_cover DECIMAL(5,2),
+    weather_code SMALLINT,
+
+    -- Provenance. Visibility comes from a different source than the
+    -- reanalysis variables; see weather_etl.py.
+    visibility_source VARCHAR(50),
+    source_dataset VARCHAR(50),
+    source_model VARCHAR(50),
+    source_timezone VARCHAR(50),
+
+    CONSTRAINT fk_weather_airport
+        FOREIGN KEY (airport_key)
+        REFERENCES dim_airport(airport_key),
+
+    -- NULLs are permitted and do not conflict, so legacy rows are unaffected.
+    -- source_model is part of the identity so that a different model/version
+    -- can never overwrite another model's observation.
+    CONSTRAINT uq_weather_airport_time
+        UNIQUE (
+            airport_key, observation_time, source_dataset, source_model
+        ),
+
+    INDEX idx_weather_airport_time (airport_key, observation_time)
 );
 
 
