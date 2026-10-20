@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template: WEEKLY weather archive refresh (P3).
+
+  *** NOT INSTALLED. This file is a template only; nothing loads it. ***
+
+  Weather is the expensive stage (external archive + IEM API calls). A
+  weekly cadence is enough for historical backfill/top-up; once
+  incremental mode is enabled in config/refresh_policy.json
+  (weather_incremental.enabled = true), each run only fetches the
+  watermark window minus the overlap, so daily would also be cheap.
+
+  To enable (macOS):
+    sed "s|__REPO_PATH__|$PWD|g" \
+      scripts/launchd/com.aviation.dw.weather.plist.template \
+      > ~/Library/LaunchAgents/com.aviation.dw.weather.plist
+    launchctl load ~/Library/LaunchAgents/com.aviation.dw.weather.plist
+
+  To disable:
+    launchctl unload ~/Library/LaunchAgents/com.aviation.dw.weather.plist
+    rm ~/Library/LaunchAgents/com.aviation.dw.weather.plist
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.aviation.dw.weather</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>__REPO_PATH__/scripts/scheduled_refresh.sh</string>
+      <string>--source</string>
+      <string>weather</string>
+    </array>
+
+    <!-- Sundays at 04:00 -->
+    <key>StartCalendarInterval</key>
+    <array>
+      <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+      </dict>
+    </array>
+
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_PATH__/logs/launchd_weather.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_PATH__/logs/launchd_weather.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+  </dict>
+</plist>

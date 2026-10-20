@@ -51,7 +51,7 @@ INSERT_CHUNK_SIZE = 1000
 # window return HTTP 400, so flight date ranges are clamped to it. Future
 # flights simply have no observation available and remain unmatched.
 ARCHIVE_MIN_DATE = date(1940, 1, 1)
-ARCHIVE_MAX_DATE = date.today()
+ARCHIVE_MAX_DATE = date.today() - timedelta(days=1)
 
 # IEM/ASOS reports visibility in statute miles. 1 statute mile = 1.609344 km.
 MILES_TO_KM = 1.609344
@@ -664,13 +664,20 @@ def _upsert_weather(conn, rows):
 # WEATHER ETL
 # ==========================================
 
-def run_weather_etl(dry_run=False, airport_filter=None):
+def run_weather_etl(dry_run=False, airport_filter=None,
+                    start_date_override=None):
     """Historical weather ETL.
 
     ``dry_run=True`` performs every step except database writes, allowing
     API + matching validation without mutating the warehouse. This function
     never assigns weather keys to fact_flight - that is a separate, gated
     operation.
+
+    ``start_date_override`` (data-refresh policy, P2): a ``datetime.date``
+    that raises the per-airport fetch start to at least that day
+    (incremental window; ``refresh_orchestrator`` derives it from the
+    per-airport watermarks minus the configured overlap). ``None`` (the
+    default) keeps the original full-range behaviour exactly.
     """
 
     print("\n" + "=" * 70)
@@ -679,6 +686,12 @@ def run_weather_etl(dry_run=False, airport_filter=None):
 
     if dry_run:
         print(" [dry-run] No database writes will be performed.")
+
+    if start_date_override is not None:
+        print(
+            f" Incremental window: fetching from {start_date_override} "
+            "(watermark - overlap), never earlier than each airport's span"
+        )
 
     flights = _read_flights()
     airport_keys = _read_airport_keys()
@@ -726,7 +739,10 @@ def run_weather_etl(dry_run=False, airport_filter=None):
 
         start_date = max(
             span["min"].date(), ARCHIVE_MIN_DATE
-        ).strftime("%Y-%m-%d")
+        )
+        if start_date_override is not None:
+            start_date = max(start_date, start_date_override)
+        start_date = start_date.strftime("%Y-%m-%d")
         end_date = min(
             span["max"].date(), ARCHIVE_MAX_DATE
         ).strftime("%Y-%m-%d")
