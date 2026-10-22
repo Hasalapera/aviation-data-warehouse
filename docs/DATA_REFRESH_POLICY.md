@@ -16,8 +16,9 @@ approach was chosen, and the guarantees every refresh must uphold.
 3. Existing ETL code (`etl.py`, `weather_etl.py`, `oltp_etl.py`,
    `main_etl.py`) keeps its behaviour. Refresh orchestration wraps those
    entry points; it never reimplements extract/transform/load logic.
-   `weather_etl.py` received exactly one additive, default-preserving
-   keyword (`start_date_override=None`, P2).
+   `weather_etl.py` received only additive, default-preserving keywords:
+   `start_date_override=None` and the per-airport
+   `start_date_overrides=None` mapping (P2).
 4. Every stage attempt leaves an audit row, even when the stage
    transaction rolls back (audit writes use a separate autocommit
    session).
@@ -64,24 +65,55 @@ out of policy.
 ### Weather incremental design (opt-in, default OFF)
 
 Config: `weather_incremental = {"enabled": false, "overlap_days": 7}`.
+`overlap_days` must be an integer `>= 0`; invalid values fail config
+loading (exit `2`) instead of silently using a different window.
 
 - Watermarks are per origin airport, stored in `etl_watermark`
-  (`window_key = airport_code`, `watermark_value = MAX(observation_time)`).
-- Fetch start = `min(per-airport watermarks) - overlap_days` (one global
-  window; the stage fetches per airport).
-- If any watermark is missing (first run), the fetch is full-range -
-  identical to existing behaviour - and afterwards establishes watermarks.
-- Watermarks advance **only after** the weather stage transaction
-  committed **and** post-load verification actually ran and did not fail.
-  Skipping verification (`--no-verify` or `run_verification=false`)
-  suppresses watermark advancement entirely - a watermark never moves on
-  an unverified run.
-- Per-airport advance condition: `MAX(observation_time).date() >=
-  expected_fetch_end - 1 day`. An airport whose fetch failed keeps its old
-  watermark, so the next run re-covers it (self-healing).
+  (`window_key = airport_code`, `watermark_value = MAX(observation_time)`
+  within the validated window).
+- Fetch start is computed **per airport** from that airport's own
+  watermark: `watermark_date - overlap_days`, then raised to the airport's
+  first flight and the archive's earliest available day. One airport's
+  watermark never shortens another airport's window.
+- An airport with no watermark (first run, newly added airport, or an
+  unreadable watermark) is absent from the per-airport override map and
+  keeps its **full available history**. This is deliberately safe: the
+  first run establishes watermarks, and recovery never relies on a guessed
+  partial range.
+- Fetch end per airport is `min(airport's last flight date, archive's
+  latest available day)`. Flights outside archive coverage (e.g. future
+  flights) never inflate a watermark.
+- Watermarks advance **only after** the weather stage completed as
+  `SUCCESS` **and** post-load verification actually ran and did not fail.
+  A `PARTIAL` or `FAILED` weather stage, a failed verification, or skipped
+  verification (`--no-verify` / `run_verification=false`) advances **no**
+  weather watermark.
+- Advancement is independently re-checked against persisted data, not the
+  stage's exit code or its requested range. For each airport, every
+  calendar day in
+  `[max(first flight, watermark - overlap) .. min(last flight, archive max)]`
+  must have a persisted `open-meteo-archive` observation. The new
+  watermark is the maximum observation timestamp **inside that window**
+  (never a stale row beyond the expected end). A candidate older than the
+  stored value is rejected, so a shrinking flight window can never rewind
+  a watermark. Airports failing any part of this check keep their old
+  watermark, so the next run re-covers them (self-healing).
 - Incremental mode changes only *which window* is fetched; the upsert,
   chunking, retries and dry-run behaviour of `weather_etl.py` are
-  untouched.
+  untouched. With incremental disabled, no override is passed and the
+  original full-range fetch is used exactly.
+- Known limitation: completeness is proven at calendar-day granularity
+  (plus the window's latest timestamp). Interior missing hours are not
+  individually detected, and detection of a failed airport inside a
+  successful stage still relies on the stage's summary line
+  (`airports failed : [...]`); if that format changes, the independent
+  coverage check remains the safety net and withholds incomplete airports.
+
+Current rollout: `weather_incremental.enabled` stays **false** in the
+shipped policy. The safety rules above are implemented and unit-tested,
+but they have not yet been exercised against a real archive refresh for
+every production airport. Enablement is therefore an explicit operator
+decision (see `docs/ETL_OPERATIONS.md`).
 
 ### OLTP bounded change updater (opt-in, default OFF)
 

@@ -105,6 +105,19 @@ def load_config(path=None):
         raise ValueError("weather_chunk_size must be positive")
     if int(config["stale_running_minutes"]) <= 0:
         raise ValueError("stale_running_minutes must be positive")
+    incremental = config["weather_incremental"]
+    if not isinstance(incremental, dict):
+        raise ValueError("weather_incremental must be an object")
+    try:
+        overlap_days = int(incremental.get("overlap_days", 7))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "weather_incremental.overlap_days must be an integer"
+        ) from error
+    if overlap_days < 0:
+        raise ValueError(
+            "weather_incremental.overlap_days must be zero or greater"
+        )
     return config
 
 
@@ -236,68 +249,145 @@ def _weather_partial_note(captured):
 
 
 # =========================================================
-# WEATHER WATERMARKS (P2 - opt-in)
+# WEATHER WATERMARKS (P2 - opt-in, per-airport windows)
 # =========================================================
 
-def weather_start_override(config):
-    """Global fetch start date derived from per-airport watermarks.
+def _overlap_days(config):
+    inc = config.get("weather_incremental") or {}
+    try:
+        overlap = int(inc.get("overlap_days", 7))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "weather_incremental.overlap_days must be an integer"
+        ) from error
+    if overlap < 0:
+        raise ValueError(
+            "weather_incremental.overlap_days must be zero or greater"
+        )
+    return overlap
 
-    Returns None when incremental mode is off or no watermark exists yet
-    (=> full-range fetch, i.e. existing behaviour). The overlap is
-    subtracted so late-arriving corrections are re-fetched."""
+
+def _parse_watermark_datetime(value, airport_code=None):
+    """Parse a stored watermark into the airport's local wall-clock time.
+
+    Watermarks written by this project are naive local observation times,
+    matching ``dim_weather.observation_time``. An aware value is converted
+    to the airport timezone when it is known. Unparseable/empty values are
+    treated as missing: the caller then fetches that airport's full history
+    instead of guessing an unsafe window."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        tz_name = None
+        try:
+            import weather_etl
+
+            info = weather_etl.AIRPORT_INFO.get(airport_code) or {}
+            tz_name = info.get("tz")
+        except Exception:
+            tz_name = None
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+
+                parsed = parsed.astimezone(ZoneInfo(tz_name))
+            except Exception:
+                pass
+        parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _parse_watermark_date(value, airport_code=None):
+    parsed = _parse_watermark_datetime(value, airport_code)
+    return parsed.date() if parsed is not None else None
+
+
+def _expected_weather_window(span_start, span_end, watermark_date, overlap,
+                             archive_min, archive_max):
+    """Return the inclusive (start, end) window a run must cover.
+
+    ``span_start``/``span_end`` are the airport's own flight dates. The
+    start is the later of the airport's first flight, archive coverage and
+    (when present) its own watermark minus overlap. The end is the earlier
+    of the airport's last flight and the archive's latest available day."""
+    start = max(span_start, archive_min)
+    if watermark_date is not None:
+        start = max(start, watermark_date - timedelta(days=overlap))
+    end = min(span_end, archive_max)
+    return start, end
+
+
+def weather_start_overrides(config):
+    """Per-airport fetch starts derived from each airport's own watermark.
+
+    Returns ``{airport_code: date}`` for airports with a usable watermark,
+    or None when incremental mode is off / no watermark exists. Airports
+    without a watermark are deliberately ABSENT so ``weather_etl`` keeps
+    their full available history (safe first run and recovery behaviour)."""
     inc = config.get("weather_incremental") or {}
     if not inc.get("enabled"):
         return None
+    overlap = _overlap_days(config)
     watermarks = etl_audit.get_watermarks("weather")  # AuditError propagates
     if not watermarks:
         return None
-    try:
-        earliest = min(
-            datetime.fromisoformat(str(value)) for value in watermarks.values()
-        )
-    except ValueError:
-        return None  # unreadable watermark -> full fetch (safe)
-    overlap = int(inc.get("overlap_days", 7))
-    return (earliest - timedelta(days=overlap)).date()
+    overrides = {}
+    for airport, value in watermarks.items():
+        mark_date = _parse_watermark_date(value, airport)
+        if mark_date is None:
+            print(
+                f" -> [warn] weather watermark for {airport} is unreadable "
+                f"({value!r}); fetching its full history"
+            )
+            continue
+        overrides[airport] = mark_date - timedelta(days=overlap)
+    return overrides or None
 
 
-def advance_weather_watermarks(batch_guid):
+def advance_weather_watermarks(batch_guid, config=None):
     """Advance per-airport watermarks AFTER the weather stage committed.
 
-    An airport's watermark moves only if its persisted observations reach
-    (expected fetch end - 1 day). Airports whose fetch failed keep their
-    old watermark, so the next run re-covers them. Watermark writes use the
-    separate audit session; a failure raises AuditError (reported as exit
-    code 5 - the committed data is still valid).
+    An airport's watermark moves only when its independently queried
+    persisted observations cover EVERY calendar day of the expected window
+    (its own first flight / watermark minus overlap through its last flight,
+    capped at the archive's latest available day). The persisted maximum is
+    taken from within that window, never from a stale future row.
 
-    Returns (advanced, held) dict/tuple for reporting."""
+    Airports whose fetch failed, whose data is incomplete, whose window has
+    no archive coverage, or whose configuration is unsupported keep their
+    old watermark (or none), so the next run re-covers them. Watermark
+    writes use the separate audit session; a write failure raises
+    AuditError (reported as exit code 5 - committed data is still valid).
+
+    Returns ``(advanced, held)`` for reporting."""
     from sqlalchemy import text
 
     from database import dw_engine
+    from weather_etl import AIRPORT_INFO, ARCHIVE_MAX_DATE, ARCHIVE_MIN_DATE
 
-    held = {}
+    if config is None:
+        config = load_config()
+    overlap = _overlap_days(config)
+    watermarks = etl_audit.get_watermarks("weather")
+
     advanced = {}
+    held = {}
     with dw_engine.connect() as conn:
-        persisted = {
-            row[0]: row[1]
+        spans = {
+            row[0]: (row[1], row[2])
             for row in conn.execute(
                 text(
                     """
-                    SELECT a.airport_code, MAX(w.observation_time)
-                    FROM dim_weather w
-                    JOIN dim_airport a ON w.airport_key = a.airport_key
-                    WHERE w.source_dataset = 'open-meteo-archive'
-                    GROUP BY a.airport_code
-                    """
-                )
-            ).fetchall()
-        }
-        expected = {
-            row[0]: row[1]
-            for row in conn.execute(
-                text(
-                    """
-                    SELECT a.airport_code, MAX(DATE(f.scheduled_departure))
+                    SELECT a.airport_code,
+                           MIN(DATE(f.scheduled_departure)),
+                           MAX(DATE(f.scheduled_departure))
                     FROM fact_flight f
                     JOIN dim_route r ON f.route_key = r.route_key
                     JOIN dim_airport a ON r.origin_airport_key = a.airport_key
@@ -306,21 +396,91 @@ def advance_weather_watermarks(batch_guid):
                 )
             ).fetchall()
         }
-    for airport, expected_end in expected.items():
-        max_obs = persisted.get(airport)
-        if max_obs is None:
-            held[airport] = "no persisted observations"
-            continue
-        if max_obs.date() >= (expected_end - timedelta(days=1)):
+
+        for airport, (span_start, span_end) in spans.items():
+            if airport not in AIRPORT_INFO:
+                held[airport] = "no coordinates/timezone/ICAO configured"
+                continue
+
+            watermark_mark = _parse_watermark_datetime(
+                watermarks.get(airport), airport
+            )
+            if watermark_mark is not None:
+                watermark_mark = watermark_mark.replace(microsecond=0)
+            watermark_date = (
+                watermark_mark.date() if watermark_mark is not None else None
+            )
+            expected_start, expected_end = _expected_weather_window(
+                span_start, span_end, watermark_date, overlap,
+                ARCHIVE_MIN_DATE, ARCHIVE_MAX_DATE,
+            )
+            if expected_start > expected_end:
+                held[airport] = (
+                    f"no archive coverage required "
+                    f"({expected_start}..{expected_end})"
+                )
+                continue
+
+            coverage_rows = conn.execute(
+                text(
+                    """
+                    SELECT DATE(w.observation_time) AS obs_date,
+                           MAX(w.observation_time) AS max_obs
+                    FROM dim_weather w
+                    JOIN dim_airport a ON w.airport_key = a.airport_key
+                    WHERE a.airport_code = :airport
+                      AND w.source_dataset = 'open-meteo-archive'
+                      AND w.observation_time IS NOT NULL
+                      AND DATE(w.observation_time) >= :expected_start
+                      AND DATE(w.observation_time) <= :expected_end
+                    GROUP BY DATE(w.observation_time)
+                    """
+                ),
+                {
+                    "airport": airport,
+                    "expected_start": expected_start,
+                    "expected_end": expected_end,
+                },
+            ).fetchall()
+
+            if not coverage_rows:
+                held[airport] = (
+                    f"no persisted observations for "
+                    f"{expected_start}..{expected_end}"
+                )
+                continue
+
+            present_dates = {row[0] for row in coverage_rows}
+            max_obs = max(row[1] for row in coverage_rows)
+            missing = [
+                expected_start + timedelta(days=offset)
+                for offset in range(
+                    (expected_end - expected_start).days + 1
+                )
+                if expected_start + timedelta(days=offset)
+                not in present_dates
+            ]
+            if missing:
+                held[airport] = (
+                    f"incomplete persisted coverage: {len(missing)} day(s) "
+                    f"missing from {expected_start}..{expected_end} "
+                    f"(first missing {missing[0]})"
+                )
+                continue
+
+            candidate = max_obs.replace(microsecond=0)
+            if watermark_mark is not None and candidate < watermark_mark:
+                held[airport] = (
+                    f"validated data would move the watermark backwards "
+                    f"({candidate} < {watermark_mark})"
+                )
+                continue
+
             etl_audit.record_watermark(
-                "weather", airport, max_obs.replace(microsecond=0), batch_guid
+                "weather", airport, candidate, batch_guid,
             )
             advanced[airport] = str(max_obs)
-        else:
-            held[airport] = (
-                f"persisted {max_obs.date()} < expected {expected_end} "
-                "(fetch incomplete)"
-            )
+
     return advanced, held
 
 
@@ -342,8 +502,10 @@ def _default_stages(config):
     except Exception:
         pass
 
-    def weather_stage(start_date_override=None):
-        if start_date_override is not None:
+    def weather_stage(start_date_override=None, start_date_overrides=None):
+        if start_date_overrides is not None:
+            run_weather_etl(start_date_overrides=start_date_overrides)
+        elif start_date_override is not None:
             run_weather_etl(start_date_override=start_date_override)
         else:
             run_weather_etl()
@@ -509,14 +671,23 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
         print(f" >>> STAGE [{source}] (batch {batch_guid[:8]})")
         print("-" * 78)
 
-        # P2: compute weather fetch window BEFORE the stage; an audit
-        # failure here is fail-closed (stage simply does not run).
-        start_override = None
+        # P2: compute per-airport weather fetch windows BEFORE the stage;
+        # an audit failure here is fail-closed (stage simply does not run).
+        start_overrides = None
         if source == "weather" and (config.get("weather_incremental") or {}).get("enabled"):
             try:
-                start_override = weather_start_override(config)
-                if start_override is not None:
-                    print(f" -> incremental window: start >= {start_override}")
+                start_overrides = weather_start_overrides(config)
+                if start_overrides:
+                    rendered = ", ".join(
+                        f"{airport}>={start}"
+                        for airport, start in sorted(start_overrides.items())
+                    )
+                    print(f" -> incremental windows: {rendered}")
+                else:
+                    print(
+                        " -> incremental windows: no usable watermarks - "
+                        "full history for every airport"
+                    )
             except etl_audit.AuditError as error:
                 audit_failure = (
                     EXIT_AUDIT_START,
@@ -554,8 +725,8 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
         stage_error = None
         try:
             kwargs = {}
-            if start_override is not None:
-                kwargs["start_date_override"] = start_override
+            if start_overrides is not None:
+                kwargs["start_date_overrides"] = start_overrides
             stages[source](**kwargs)
         except KeyboardInterrupt:
             interrupted = True
@@ -737,15 +908,26 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
         and verify_ok
     ):
         try:
-            advanced, held = advance_weather_watermarks(batch_guid)
+            advanced, held = advance_weather_watermarks(batch_guid, config)
             print(
                 f" -> watermarks advanced for {len(advanced)} airport(s); "
-                f"held for {len(held)} ({held or 'none'})"
+                f"held for {len(held)}"
             )
+            for airport, reason in sorted(held.items()):
+                print(f"    held {airport}: {reason}")
         except etl_audit.AuditError as error:
             print(
                 f"\n[FATAL][EXIT {EXIT_AUDIT_FINISH}] weather stage committed "
                 f"but watermark write failed (next run re-fetches - safe): {error}"
+            )
+            _print_summary(results, batch_guid, started, aborted=True)
+            return EXIT_AUDIT_FINISH
+        except Exception as error:
+            print(
+                f"\n[FATAL][EXIT {EXIT_AUDIT_FINISH}] weather stage committed "
+                f"but watermark advancement check failed "
+                f"({type(error).__name__}: {error}); watermarks that were not "
+                f"advanced will be re-covered next run"
             )
             _print_summary(results, batch_guid, started, aborted=True)
             return EXIT_AUDIT_FINISH
@@ -763,8 +945,23 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
                 " -> weather watermarks unchanged (verification failed)"
             )
     elif weather_status:
-        print(" -> weather watermarks unchanged (incremental off or stage "
-              "not successful)")
+        incremental_on = bool(
+            (config.get("weather_incremental") or {}).get("enabled")
+        )
+        if incremental_on and weather_status == "PARTIAL":
+            print(
+                " -> weather watermarks NOT advanced: weather stage was "
+                "PARTIAL (at least one airport failed)"
+            )
+        elif incremental_on and weather_status != "SUCCESS":
+            print(
+                f" -> weather watermarks NOT advanced: weather stage was "
+                f"{weather_status}"
+            )
+        else:
+            print(
+                " -> weather watermarks unchanged (incremental mode is off)"
+            )
 
     # ---------- exit code ----------
     _print_summary(results, batch_guid, started)

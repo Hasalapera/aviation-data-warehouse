@@ -1,5 +1,7 @@
-"""P2 tests: weather incremental watermarks, the additive start_date_override
-kwarg, batch-size preservation, and the bounded OLTP change updater.
+"""P2 tests: per-airport weather incremental windows, watermark safety
+(partial/failed/unverified/coverage-gap runs never advance), the additive
+weather override kwargs, batch-size preservation, and the bounded OLTP
+change updater.
 
 The change updater is tested twice:
 * against a writable local fixture source DB (`aviation_oltp_ci`) - the
@@ -9,11 +11,14 @@ The change updater is tested twice:
   - skipped when unreachable.
 """
 
+import contextlib
 import copy
+import io
 import os
 import sys
 import unittest
 from datetime import date, datetime, timedelta
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -99,37 +104,109 @@ def _seed_fixture_flight(fixture):
 
 
 class TestWeatherWatermarkLogic(unittest.TestCase):
+    FAKE_AIRPORTS = {
+        code: {"lat": 0.0, "lon": 0.0, "tz": "UTC", "icao": code}
+        for code in ("WTOA", "WTWB", "WTCA", "WTCB", "WTCC", "WTCD")
+    }
+
     @classmethod
     def setUpClass(cls):
         dbutil.recreate_schema()
 
     def setUp(self):
         dbutil.clear_audit()
+        import weather_etl
+
+        weather_etl.AIRPORT_INFO.update(self.FAKE_AIRPORTS)
 
     # ---------- window derivation ----------
 
     def test_incremental_off_always_returns_none(self):
         etl_audit.record_watermark("weather", "CMBB", "2024-03-05 00:00:00")
         config = _fresh_config()
-        self.assertIsNone(ro.weather_start_override(config))
+        self.assertIsNone(ro.weather_start_overrides(config))
 
     def test_incremental_on_without_watermarks_returns_none(self):
         config = _fresh_config()
         config["weather_incremental"]["enabled"] = True
         self.assertIsNone(
-            ro.weather_start_override(config),
+            ro.weather_start_overrides(config),
             "first run must be full-range (establishes watermarks)",
         )
 
-    def test_window_is_min_watermark_minus_overlap(self):
+    def test_windows_are_per_airport_watermark_minus_overlap(self):
         config = _fresh_config()
         config["weather_incremental"]["enabled"] = True
         config["weather_incremental"]["overlap_days"] = 7
         etl_audit.record_watermark("weather", "CMBB", "2024-03-05 00:00:00")
         etl_audit.record_watermark("weather", "KEAA", "2024-03-01 12:00:00")
+        overrides = ro.weather_start_overrides(config)
         self.assertEqual(
-            ro.weather_start_override(config), date(2024, 3, 1) - timedelta(days=7)
+            overrides,
+            {
+                "CMBB": date(2024, 3, 5) - timedelta(days=7),
+                "KEAA": date(2024, 3, 1) - timedelta(days=7),
+            },
+            "each airport must use its own watermark, not one global minimum",
         )
+        self.assertNotEqual(
+            overrides["CMBB"], overrides["KEAA"],
+            "a single global window would give both airports the same start",
+        )
+
+    def test_zero_overlap_uses_the_watermark_date(self):
+        config = _fresh_config()
+        config["weather_incremental"]["enabled"] = True
+        config["weather_incremental"]["overlap_days"] = 0
+        etl_audit.record_watermark("weather", "CMBB", "2024-03-05 23:00:00")
+        self.assertEqual(
+            ro.weather_start_overrides(config), {"CMBB": date(2024, 3, 5)}
+        )
+
+    def test_airports_without_watermarks_are_absent_from_overrides(self):
+        config = _fresh_config()
+        config["weather_incremental"]["enabled"] = True
+        etl_audit.record_watermark("weather", "CMBB", "2024-03-05 00:00:00")
+        overrides = ro.weather_start_overrides(config)
+        self.assertEqual(set(overrides), {"CMBB"},
+                         "a missing watermark must stay absent so that airport "
+                         "fetches its full history")
+
+    def test_unreadable_watermark_falls_back_to_full_history(self):
+        config = _fresh_config()
+        config["weather_incremental"]["enabled"] = True
+        etl_audit.record_watermark("weather", "CMBB", "not-a-date")
+        etl_audit.record_watermark("weather", "KEAA", "2024-03-01 12:00:00")
+        overrides = ro.weather_start_overrides(config)
+        self.assertEqual(
+            set(overrides), {"KEAA"},
+            "an unreadable watermark must not produce a guessed window",
+        )
+        self.assertNotIn("CMBB", overrides)
+
+    def test_aware_watermark_is_converted_to_airport_local_date(self):
+        self.assertEqual(
+            ro._parse_watermark_date("2024-03-05T20:00:00+00:00", "CMB"),
+            date(2024, 3, 6),
+            "CMB is UTC+5:30, so 20:00Z is the next local calendar day",
+        )
+
+    def test_negative_overlap_is_rejected(self):
+        import json
+        import tempfile
+
+        config = _fresh_config()
+        config["weather_incremental"]["overlap_days"] = -1
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False
+        ) as handle:
+            json.dump(config, handle)
+            path = handle.name
+        try:
+            with self.assertRaises(ValueError):
+                ro.load_config(path)
+        finally:
+            os.unlink(path)
 
     # ---------- advancement gating ----------
 
@@ -142,7 +219,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         marks = etl_audit.get_watermarks("weather")
 
         self.assertIn(airport_a, advanced,
-                      "observed through expected end - 1 day -> advance")
+                      "complete coverage through the expected end -> advance")
         self.assertNotIn(airport_a, held)
         self.assertIn(airport_b, held, "incomplete fetch -> hold")
         self.assertNotIn(airport_b, marks)
@@ -167,14 +244,15 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
             etl_audit.get_watermarks("weather")[airport_a], stored[0]
         )
 
-    def test_orchestrator_passes_window_only_when_incremental(self):
+    def test_orchestrator_passes_per_airport_windows_only_when_incremental(self):
         from database import dw_engine
 
         with dw_engine.begin() as conn:
             conn.execute(text(
                 "INSERT INTO etl_watermark (source_name, window_key,"
                 " watermark_value, updated_at, last_batch_guid) VALUES"
-                " ('weather', 'WWWW', '2024-03-05 00:00:00', NOW(3), 'b0')"
+                " ('weather', 'WWWW', '2024-03-05 00:00:00', NOW(3), 'b0'),"
+                " ('weather', 'VVVV', '2024-03-01 00:00:00', NOW(3), 'b0')"
             ))
         seen = []
 
@@ -194,11 +272,15 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         self.assertEqual(code, ro.EXIT_OK)
         self.assertEqual(len(seen), 1)
         self.assertEqual(
-            seen[0].get("start_date_override"),
-            date(2024, 3, 5) - timedelta(days=7),
+            seen[0].get("start_date_overrides"),
+            {
+                "WWWW": date(2024, 3, 5) - timedelta(days=7),
+                "VVVV": date(2024, 3, 1) - timedelta(days=7),
+            },
         )
+        self.assertNotIn("start_date_override", seen[0])
 
-        # same config with incremental disabled: kwarg must NOT be passed
+        # same config with incremental disabled: kwargs must NOT be passed
         seen.clear()
         config["weather_incremental"]["enabled"] = False
         code = ro.run_refresh(
@@ -207,7 +289,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         )
         self.assertEqual(code, ro.EXIT_OK)
         self.assertEqual(seen, [{}],
-                         "default call path must stay start_date_override-free")
+                         "default call path must stay override-free")
 
     # ---------- verification gate on watermark advancement ----------
 
@@ -282,6 +364,50 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
             "a PARTIAL weather stage must not advance any watermark",
         )
 
+    def test_unexpected_advancement_failure_is_reported_and_fails_safely(self):
+        self._seed_airports_and_flights()
+        with mock.patch.object(
+            ro, "advance_weather_watermarks",
+            side_effect=RuntimeError("coverage query failed"),
+        ):
+            code = ro.run_refresh(
+                self._incremental_weather_config(),
+                stages={"weather": self._clean_weather_stage},
+                verifier=_passing_verifier,
+                sources={"weather"},
+            )
+        self.assertEqual(code, ro.EXIT_AUDIT_FINISH)
+        self.assertEqual(etl_audit.get_watermarks("weather"), {})
+
+    def test_watermark_write_failure_after_commit_is_reported(self):
+        airport_a, _ = self._seed_airports_and_flights()
+        with mock.patch.object(
+            etl_audit, "record_watermark",
+            side_effect=etl_audit.AuditError("controlled write failure"),
+        ):
+            code = ro.run_refresh(
+                self._incremental_weather_config(),
+                stages={"weather": self._clean_weather_stage},
+                verifier=_passing_verifier,
+                sources={"weather"},
+            )
+
+        self.assertEqual(code, ro.EXIT_AUDIT_FINISH)
+        self.assertNotIn(airport_a, etl_audit.get_watermarks("weather"))
+
+        from database import dw_engine
+
+        with dw_engine.connect() as conn:
+            persisted = conn.execute(text(
+                "SELECT COUNT(*) FROM dim_weather w "
+                "JOIN dim_airport a ON w.airport_key=a.airport_key "
+                "WHERE a.airport_code=:a"
+            ), {"a": airport_a}).scalar()
+        self.assertGreaterEqual(
+            persisted, 1,
+            "committed weather data must survive a watermark write failure",
+        )
+
     def test_watermark_not_advanced_when_stage_fails(self):
         airport_a, _ = self._seed_airports_and_flights()
 
@@ -296,6 +422,248 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         self.assertEqual(code, ro.EXIT_STAGE_FAILED)
         self.assertNotIn(airport_a, etl_audit.get_watermarks("weather"))
 
+    # ---------- independent coverage checks ----------
+
+    def test_incomplete_persisted_range_holds_watermark(self):
+        airport = self._seed_airport_series(
+            "WTCA",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-gap", _fresh_config()
+        )
+        self.assertIn(airport, held, "a missing calendar day must block advance")
+        self.assertNotIn(airport, advanced)
+        self.assertNotIn(airport, etl_audit.get_watermarks("weather"))
+
+    def test_complete_persisted_range_advances_to_expected_end(self):
+        airport = self._seed_airport_series(
+            "WTCB",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[
+                date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3)
+            ],
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-complete", _fresh_config()
+        )
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        marks = etl_audit.get_watermarks("weather")
+        self.assertIn(airport, marks)
+        self.assertTrue(marks[airport].startswith("2024-06-03"))
+
+    def test_future_flights_and_stale_rows_cannot_inflate_watermark(self):
+        import weather_etl
+
+        airport = self._seed_airport_series(
+            "WTCC",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 30)],
+            observation_dates=[
+                date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3),
+                date(2024, 6, 10),
+            ],
+        )
+        with mock.patch.object(
+            weather_etl, "ARCHIVE_MAX_DATE", date(2024, 6, 3)
+        ):
+            advanced, held = ro.advance_weather_watermarks(
+                "batch-cap", _fresh_config()
+            )
+        self.assertIn(airport, advanced)
+        marks = etl_audit.get_watermarks("weather")
+        self.assertTrue(
+            marks[airport].startswith("2024-06-03"),
+            "the expected end is capped at archive coverage and the stale "
+            "persisted maximum (2024-06-10) must not be used",
+        )
+
+    def test_watermark_never_moves_backwards_when_window_shrinks(self):
+        airport = self._seed_airport_series(
+            "WTCD",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 15)],
+            observation_dates=[
+                date(2024, 6, 1) + timedelta(days=offset)
+                for offset in range(15)
+            ],
+        )
+        etl_audit.record_watermark(
+            "weather", airport, "2024-06-20 12:00:00"
+        )
+
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-shrink", _fresh_config()
+        )
+
+        self.assertIn(airport, held)
+        self.assertNotIn(airport, advanced)
+        marks = etl_audit.get_watermarks("weather")
+        self.assertTrue(
+            marks[airport].startswith("2024-06-20"),
+            "a shorter validated window must not rewind an existing watermark",
+        )
+
+    def test_repeated_runs_keep_watermark_value_and_audit_rows(self):
+        airport, _ = self._seed_airports_and_flights()
+        config = self._incremental_weather_config()
+        for _ in range(2):
+            code = ro.run_refresh(
+                config,
+                stages={"weather": self._clean_weather_stage},
+                verifier=_passing_verifier,
+                sources={"weather"},
+            )
+            self.assertEqual(code, ro.EXIT_OK)
+        marks = etl_audit.get_watermarks("weather")
+        self.assertIn(airport, marks)
+        self.assertTrue(marks[airport].startswith("2024-04-01"))
+        from database import dw_engine
+
+        with dw_engine.connect() as conn:
+            runs = conn.execute(text(
+                "SELECT status FROM etl_batch_log "
+                "WHERE source_name='weather' ORDER BY run_id"
+            )).fetchall()
+        self.assertEqual([row[0] for row in runs], ["SUCCESS", "SUCCESS"])
+
+    # ---------- stage-level per-airport windows ----------
+
+    @staticmethod
+    def _archive_frame(start_date):
+        import pandas as pd
+
+        return pd.DataFrame({
+            "time": [pd.Timestamp(f"{start_date} 00:00:00")],
+            "temperature_2m": [25.0],
+            "relative_humidity_2m": [60.0],
+            "precipitation": [0.0],
+            "wind_speed_10m": [5.0],
+            "cloud_cover": [10.0],
+            "weather_code": [0],
+        })
+
+    def _run_weather_stage(self, overrides=None, shared_override=None,
+                           failing=()):
+        calls, _ = self._run_weather_stage_capture(
+            overrides=overrides, shared_override=shared_override,
+            failing=failing,
+        )
+        return calls
+
+    def _run_weather_stage_capture(self, overrides=None, shared_override=None,
+                                   failing=()):
+        import pandas as pd
+
+        import weather_etl
+
+        flights = pd.DataFrame({
+            "source_system": ["csv"] * 6,
+            "source_flight_id": [f"w{i}" for i in range(6)],
+            "scheduled_departure": pd.to_datetime([
+                "2024-03-01 10:00:00", "2024-03-31 10:00:00",
+                "2024-03-01 11:00:00", "2024-03-31 11:00:00",
+                "2024-03-01 12:00:00", "2024-03-31 12:00:00",
+            ]),
+            "airport_code": ["CMB", "CMB", "DXB", "DXB", "LHR", "LHR"],
+        })
+        calls = []
+
+        def fake_archive(code, info, start_date, end_date):
+            calls.append((code, start_date, end_date))
+            if code in failing:
+                raise RuntimeError("controlled archive failure")
+            return self._archive_frame(start_date)
+
+        def fake_visibility(icao, tz, start_date, end_date):
+            return pd.DataFrame(columns=["time", "visibility_km"])
+
+        out = io.StringIO()
+        with mock.patch.object(
+            weather_etl, "_read_flights", return_value=flights
+        ), mock.patch.object(
+            weather_etl, "_read_airport_keys",
+            return_value={"CMB": 1, "DXB": 2, "LHR": 3},
+        ), mock.patch.object(
+            weather_etl, "fetch_archive_weather", side_effect=fake_archive
+        ), mock.patch.object(
+            weather_etl, "fetch_iem_visibility", side_effect=fake_visibility
+        ), contextlib.redirect_stdout(out):
+            weather_etl.run_weather_etl(
+                dry_run=True,
+                start_date_override=shared_override,
+                start_date_overrides=overrides,
+            )
+        return calls, out.getvalue()
+
+    def test_weather_etl_applies_each_airports_own_override(self):
+        calls = self._run_weather_stage(
+            overrides={"CMB": "2024-03-10", "DXB": date(2024, 3, 20)}
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("CMB", "2024-03-10", "2024-03-31"),
+                ("DXB", "2024-03-20", "2024-03-31"),
+                ("LHR", "2024-03-01", "2024-03-31"),
+            ],
+            "airports without a watermark keep their full span",
+        )
+
+    def test_weather_etl_defaults_to_full_range(self):
+        calls = self._run_weather_stage()
+        self.assertEqual(
+            {code: start for code, start, _ in calls},
+            {"CMB": "2024-03-01", "DXB": "2024-03-01", "LHR": "2024-03-01"},
+        )
+
+    def test_weather_etl_partial_fetch_reports_failed_airport(self):
+        calls, output = self._run_weather_stage_capture(failing={"CMB"})
+        self.assertEqual(
+            [code for code, _, _ in calls], ["CMB", "DXB", "LHR"],
+            "a failed airport must not stop the other airports",
+        )
+        self.assertIn("['CMB']", output,
+                      "the stage summary must name the failed airport so the "
+                      "orchestrator can mark the stage PARTIAL")
+
+    def test_weather_etl_shared_override_still_supported(self):
+        calls = self._run_weather_stage(shared_override=date(2024, 3, 5))
+        self.assertEqual(
+            {code: start for code, start, _ in calls},
+            {"CMB": "2024-03-05", "DXB": "2024-03-05", "LHR": "2024-03-05"},
+        )
+
+    def test_invalid_per_airport_override_fails_before_fetch(self):
+        import weather_etl
+
+        with mock.patch.object(weather_etl, "_read_flights") as read:
+            with self.assertRaises(ValueError):
+                weather_etl.run_weather_etl(
+                    dry_run=True,
+                    start_date_overrides={"CMB": "not-a-date"},
+                )
+            read.assert_not_called()
+
+        with self.assertRaises(TypeError):
+            weather_etl.run_weather_etl(
+                dry_run=True, start_date_overrides=["CMB"]
+            )
+
+    def test_default_weather_stage_forwards_overrides(self):
+        import weather_etl
+
+        overrides = {"CMB": date(2024, 3, 10)}
+        with mock.patch.object(weather_etl, "run_weather_etl") as fake:
+            stages = ro._default_stages(_fresh_config())
+            stages["weather"](start_date_overrides=overrides)
+            fake.assert_called_once_with(start_date_overrides=overrides)
+
+        with mock.patch.object(weather_etl, "run_weather_etl") as fake:
+            stages = ro._default_stages(_fresh_config())
+            stages["weather"]()
+            fake.assert_called_once_with()
+
     # ---------- additive signature ----------
 
     def test_run_weather_etl_signature_is_additive(self):
@@ -306,6 +674,8 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         params = inspect.signature(weather_etl.run_weather_etl).parameters
         self.assertIn("start_date_override", params)
         self.assertIsNone(params["start_date_override"].default)
+        self.assertIn("start_date_overrides", params)
+        self.assertIsNone(params["start_date_overrides"].default)
         self.assertIs(params["dry_run"].default, False)
         self.assertIsNone(params["airport_filter"].default)
 
@@ -325,6 +695,62 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
             weather_etl.INSERT_CHUNK_SIZE = original
 
     # ---------- fixtures ----------
+
+    def _seed_airport_series(self, code, flight_dates, observation_dates):
+        """Seed one airport with multiple flight days and observation days."""
+        from database import dw_engine
+
+        with dw_engine.begin() as conn:
+            conn.execute(text(
+                "INSERT IGNORE INTO dim_airport "
+                "(airport_code, airport_name) VALUES (:c, :c)"
+            ), {"c": code})
+            airport_key = conn.execute(text(
+                "SELECT airport_key FROM dim_airport WHERE airport_code=:c"
+            ), {"c": code}).scalar()
+            conn.execute(text(
+                "INSERT IGNORE INTO dim_airline (airline_code, airline_name)"
+                " VALUES ('WTS', 'Watermark Series Air')"
+            ))
+            airline_key = conn.execute(text(
+                "SELECT airline_key FROM dim_airline WHERE airline_code='WTS'"
+            )).scalar()
+            conn.execute(text(
+                "INSERT IGNORE INTO dim_route (origin_airport_key,"
+                " destination_airport_key) VALUES (:k, :k)"
+            ), {"k": airport_key})
+            route_key = conn.execute(text(
+                "SELECT route_key FROM dim_route WHERE origin_airport_key=:k"
+            ), {"k": airport_key}).scalar()
+            for index, flight_date in enumerate(flight_dates):
+                date_key = int(flight_date.strftime("%Y%m%d"))
+                conn.execute(text(
+                    "INSERT IGNORE INTO dim_date (date_key, full_date)"
+                    " VALUES (:dk, :fd)"
+                ), {"dk": date_key, "fd": flight_date})
+                conn.execute(text(
+                    "INSERT IGNORE INTO fact_flight (source_system,"
+                    " source_flight_id, date_key, airline_key, route_key,"
+                    " scheduled_departure) VALUES"
+                    " ('csv', :sid, :dk, :ak, :rk, :sd)"
+                ), {
+                    "sid": f"{code.lower()}-{index}",
+                    "dk": date_key,
+                    "ak": airline_key,
+                    "rk": route_key,
+                    "sd": f"{flight_date} 10:00:00",
+                })
+            for observation_date in observation_dates:
+                conn.execute(text(
+                    "INSERT IGNORE INTO dim_weather (airport_key,"
+                    " observation_time, temperature, source_dataset,"
+                    " source_model) VALUES"
+                    " (:k, :obs, 25.0, 'open-meteo-archive', 'best_match')"
+                ), {
+                    "k": airport_key,
+                    "obs": f"{observation_date} 12:00:00",
+                })
+        return code
 
     def _seed_airports_and_flights(self):
         from database import dw_engine

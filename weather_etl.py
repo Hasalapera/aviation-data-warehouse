@@ -664,8 +664,25 @@ def _upsert_weather(conn, rows):
 # WEATHER ETL
 # ==========================================
 
+def _coerce_override_date(value):
+    """Convert a date/datetime/ISO string override to ``datetime.date``."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.fromisoformat(str(value)).date()
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"invalid start-date override: {value!r}"
+        ) from error
+
+
 def run_weather_etl(dry_run=False, airport_filter=None,
-                    start_date_override=None):
+                    start_date_override=None, start_date_overrides=None):
     """Historical weather ETL.
 
     ``dry_run=True`` performs every step except database writes, allowing
@@ -674,10 +691,16 @@ def run_weather_etl(dry_run=False, airport_filter=None,
     operation.
 
     ``start_date_override`` (data-refresh policy, P2): a ``datetime.date``
-    that raises the per-airport fetch start to at least that day
-    (incremental window; ``refresh_orchestrator`` derives it from the
-    per-airport watermarks minus the configured overlap). ``None`` (the
-    default) keeps the original full-range behaviour exactly.
+    that raises every airport's fetch start to at least that day. Kept for
+    callers that need one shared lower bound.
+
+    ``start_date_overrides`` (P2, per-airport): a mapping of
+    ``airport_code -> date`` that raises that airport's fetch start to at
+    least its own day (``refresh_orchestrator`` derives it from each
+    airport's watermark minus the configured overlap). Airports absent from
+    the mapping keep their full available history, so a first run or a
+    newly-added airport is never partially covered. Both arguments default
+    to ``None``, preserving the original full-range behaviour exactly.
     """
 
     print("\n" + "=" * 70)
@@ -687,9 +710,31 @@ def run_weather_etl(dry_run=False, airport_filter=None,
     if dry_run:
         print(" [dry-run] No database writes will be performed.")
 
-    if start_date_override is not None:
+    if start_date_overrides is not None and not isinstance(
+        start_date_overrides, dict
+    ):
+        raise TypeError(
+            "start_date_overrides must be a mapping of airport_code -> date"
+        )
+
+    per_airport_overrides = None
+    if start_date_overrides is not None:
+        per_airport_overrides = {
+            code: _coerce_override_date(value)
+            for code, value in start_date_overrides.items()
+        }
+
+    shared_override = _coerce_override_date(start_date_override)
+
+    if per_airport_overrides:
         print(
-            f" Incremental window: fetching from {start_date_override} "
+            " Incremental windows: each airport starts at its own "
+            "watermark - overlap; airports without a watermark fetch "
+            "their full history"
+        )
+    elif shared_override is not None:
+        print(
+            f" Incremental window: fetching from {shared_override} "
             "(watermark - overlap), never earlier than each airport's span"
         )
 
@@ -740,8 +785,12 @@ def run_weather_etl(dry_run=False, airport_filter=None,
         start_date = max(
             span["min"].date(), ARCHIVE_MIN_DATE
         )
-        if start_date_override is not None:
-            start_date = max(start_date, start_date_override)
+        if shared_override is not None:
+            start_date = max(start_date, shared_override)
+        if per_airport_overrides:
+            airport_override = per_airport_overrides.get(airport_code)
+            if airport_override is not None:
+                start_date = max(start_date, airport_override)
         start_date = start_date.strftime("%Y-%m-%d")
         end_date = min(
             span["max"].date(), ARCHIVE_MAX_DATE

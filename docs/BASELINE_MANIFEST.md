@@ -45,13 +45,15 @@ each file, captured **before any change** and re-verified afterwards:
 (`logs/`, `scripts/launchd/*.plist`) made when the log/scheduling
 artifacts were introduced (P3). Everything else must match.
 
-\* `weather_etl.py` is the **one** protected-adjacent file approved for an
-additive, default-preserving edit in P2 (`start_date_override=None`
-keyword). Final hash after the approved edit:
-`c2c15658d52b7d320b3d5fa9a3d4e28791896b209998dce84cf1e362c7ecf83b`
-(Phase-0 hash: `74455080...`; diff = kwarg + docstring + window raise,
-behaviour unchanged for `start_date_override=None`). Every other file
-above must match exactly.
+\* `weather_etl.py` is the **one** protected-adjacent file approved for
+additive, default-preserving edits in P2: the shared
+`start_date_override=None` keyword and the per-airport
+`start_date_overrides=None` mapping. Final hash after the approved edits:
+`dbc47d62b371322655df1c703d1bac21c848b2f2c4e867a982a573a95cd70aa0`
+(Phase-0 hash: `74455080...`; earlier approved hashes remain accepted by
+`tests/test_query_integrity.py`). Diff = additive kwargs + docstring +
+window clamping, with behaviour unchanged when both overrides are `None`.
+Every other file above must match exactly.
 
 ## Query result baseline
 

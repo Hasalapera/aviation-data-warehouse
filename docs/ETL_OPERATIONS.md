@@ -45,15 +45,132 @@ What one run does, in order:
    and exits `130` (committed data is not rolled back).
 5. Post-load verification (read-only, `verify_warehouse.py`), itself
    audited as source `verify`.
-6. Watermarks advance (weather, only if incremental enabled, stage
-   successful, verification ran, and verification passed - `--no-verify`
-   suppresses advancement).
+6. Watermarks advance per airport (weather, only if incremental enabled,
+   the stage ended `SUCCESS`, verification ran, verification passed, and
+   that airport's persisted observations cover every day of its own
+   expected window). `--no-verify` suppresses advancement; `PARTIAL` /
+   `FAILED` stages advance nothing. Held airports are printed with the
+   reason and re-covered next run.
 7. Print summary and exit with the policy exit code.
 
 Exit codes: `0` ok, `1` required stage failed, `2` preflight, `3` locked,
-`4` audit unavailable before stage, `5` audit/watermark write failed
-after stage (data may be committed), `6` verification failed,
-`130` interrupted by operator.
+`4` audit unavailable before stage, `5` audit/watermark write or
+advancement check failed after stage (data may be committed), `6`
+verification failed, `130` interrupted by operator.
+
+## Incremental weather mode (opt-in)
+
+Incremental weather is controlled **only** by
+`config/refresh_policy.json`:
+
+```json
+"weather_incremental": { "enabled": false, "overlap_days": 7 }
+```
+
+- `enabled: false` (default) preserves the original full-range fetch
+  exactly; no per-airport override is passed to `weather_etl.py`.
+- `enabled: true` makes each airport fetch from
+  `its own watermark date - overlap_days`, clamped to its first flight.
+  Airports without a watermark fetch their full available history.
+- Enable/disable is a config edit; it does not itself start a refresh.
+  Run `--dry-run` first, then a normal audited run.
+- `overlap_days` must be `>= 0`. The overlap deliberately re-fetches recent
+  days so late archive corrections are picked up; it is not a completeness
+  margin for older data.
+- A watermark only advances when that airport's persisted observations
+  cover every calendar day of its expected window and verification passed.
+  Inspect progress and withheld airports with:
+
+```sql
+SELECT window_key, watermark_value, updated_at, last_batch_guid
+FROM etl_watermark WHERE source_name = 'weather'
+ORDER BY window_key;
+```
+
+- On a first run (no watermarks) or after deleting a watermark, that
+  airport is fetched full-range again. This is slower but safe.
+- Recovery: if a run is `PARTIAL`, fails verification, or is interrupted,
+  no watermark moves for that run. Fix the cause and rerun; incomplete
+  airports are re-covered automatically.
+
+Rollout status: the implementation is covered by deterministic tests
+(including partial fetches and coverage gaps), but the shipped default
+remains `enabled: false`. It has not yet been validated against a real
+Open-Meteo archive run across all production airports, so enabling it
+should be a deliberate operator decision after a monitored full-range /
+incremental dry run and a first audited observation of watermark
+advancement.
+
+### First enablement and monitoring
+
+1. Take a backup before the first run
+   (`venv/bin/python setup_database.py backup`).
+2. Set `weather_incremental.enabled` to `true` and confirm
+   `overlap_days` is an integer `>= 0`.
+3. Run `venv/bin/python refresh_orchestrator.py --dry-run`; require exit
+   `0` and `incremental weather: ON`. The dry run does not execute a
+   stage, take the lock, or write audit rows.
+4. Run `venv/bin/python refresh_orchestrator.py --source weather` with
+   verification enabled (the default). Do **not** use `--no-verify` on a
+   run whose watermarks should advance. Airports without watermarks fetch
+   their full available history on this first run.
+5. Watch the exit code and output. Success prints
+   `watermarks advanced for N airport(s)`; every withheld airport is
+   printed separately with its reason. `PARTIAL`, `FAILED`, a verification
+   failure, or exit `5`/`6` must be treated as "no advancement for the
+   affected airports", not as a reason to bypass verification.
+6. Inspect the audited stages and any error text:
+
+```sql
+SELECT run_id, batch_guid, source_name, status, started_at, finished_at,
+       rows_read, rows_inserted, rows_updated, rows_skipped, notes,
+       error_detail
+FROM etl_batch_log
+WHERE source_name IN ('weather', 'verify')
+ORDER BY run_id DESC LIMIT 10;
+```
+
+Stage output is written to
+`logs/refresh_<timestamp>_<batch>_<source>.log`; scheduled output, if
+enabled, is `logs/scheduled_refresh_<date>.log`. Check the watermark
+values with the `etl_watermark` query above and verify the actual
+per-airport coverage before the next run.
+
+### Verify weather coverage
+
+Run this after a refresh, replacing the dates with the expected window.
+Every calendar day required for each airport must appear; do not assume a
+fixed row count per day (DST days can have 23 or 25 hourly observations):
+
+```sql
+SELECT a.airport_code,
+       DATE(w.observation_time) AS observation_date,
+       COUNT(*) AS observations,
+       MIN(w.observation_time) AS first_observation,
+       MAX(w.observation_time) AS last_observation
+FROM dim_weather w
+JOIN dim_airport a ON w.airport_key = a.airport_key
+WHERE w.source_dataset = 'open-meteo-archive'
+  AND w.observation_time >= '2024-06-01'
+  AND w.observation_time < '2024-06-04'
+GROUP BY a.airport_code, DATE(w.observation_time)
+ORDER BY a.airport_code, observation_date;
+```
+
+The dates in the example are a bounded three-day window, not production
+dates. The orchestrator performs the same calendar-day coverage check
+against the window it derived before it advances a watermark; this query
+is the operator-facing confirmation.
+
+### Return to full-history mode
+
+Set `weather_incremental.enabled` back to `false` and run `--dry-run` to
+confirm `incremental weather: OFF`. The next normal run passes no
+per-airport override and fetches each airport's full available history
+exactly as before. Existing watermarks are ignored while incremental mode
+is disabled; keep them if incremental mode may be re-enabled later. Do
+not drop `etl_watermark` or `etl_batch_log` merely to disable incremental
+mode.
 
 ## Standalone verification
 
@@ -152,7 +269,10 @@ in the template headers.
 ## Tests
 
 ```bash
-venv/bin/python -m unittest discover        # from repo root
+venv/bin/python -m unittest discover        # full suite (from repo root)
+venv/bin/python -m unittest tests.test_watermark -v
+venv/bin/python -m unittest tests.test_query_integrity -v
+venv/bin/python refresh_orchestrator.py --dry-run
 ```
 
 - Tests force `DW_NAME=aviation_dw_ci` (disposable warehouse recreated
@@ -160,6 +280,10 @@ venv/bin/python -m unittest discover        # from repo root
   suite (guarded in `tests/__init__.py` and `tests/dbutil.py`).
 - `tests/test_etl_regression.py` runs the real CSV/OLTP stages against
   the test warehouse (OLTP stage skipped when the source is unreachable).
+- `tests/test_watermark.py` covers per-airport windows, overlap, first-run
+  behaviour, `PARTIAL`/`FAILED`/verification gating, incomplete persisted
+  coverage, future-flight capping, and repeated-run idempotency using
+  deterministic stubs (no weather network access).
 - A real weather fetch is opt-in:
   `AVIATION_TESTS_WEATHER_NET=1 venv/bin/python -m unittest discover`.
 - Pre-existing state at Phase 0: `tests/` contained only stale `.pyc`

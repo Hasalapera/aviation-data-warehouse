@@ -50,14 +50,16 @@ PROTECTED_FILE_HASHES = {
     "requirements.txt": "dbcffa093707d91ee50c23c43ed1e90c8c6d160ba21fa901e6bfb86548bc44d9",
 }
 
-# weather_etl.py permits the approved additive P2 incremental-refresh edit.
-# The third hash also includes the reviewed archive API end-date cap
-# (yesterday), required because the API rejects today's date.
-# Preserve the Phase-0 and previously approved P2 hashes.
+# weather_etl.py permits the approved additive P2 incremental-refresh edits:
+# the shared start_date_override kwarg, the reviewed archive API end-date cap
+# (yesterday), and the per-airport start_date_overrides mapping. Preserve the
+# Phase-0 and previously approved P2 hashes; the newest hash is the review
+# target.
 ALLOWED_WEATHER_ETL_HASHES = {
     "74455080579eccbeacd771f9f18e27f52312ead8244cfefd5f46d70800b0c61c",
     "c2c15658d52b7d320b3d5fa9a3d4e28791896b209998dce84cf1e362c7ecf83b",
     "a1b4fdd361d2b235b5acfc7ecefdd235edb9cdb8ca2e0edc3151a5ab5f6f4d84",
+    "dbc47d62b371322655df1c703d1bac21c848b2f2c4e867a982a573a95cd70aa0",
 }
 
 
