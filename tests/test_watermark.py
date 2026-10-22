@@ -258,6 +258,30 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
             "failed verification must suppress watermark advancement",
         )
 
+    def test_partial_weather_stage_never_advances_watermarks(self):
+        airport_a, airport_b = self._seed_airports_and_flights()
+
+        def partial_stage(**kwargs):
+            print("airports failed : ['WTOA']")
+
+        code = ro.run_refresh(
+            self._incremental_weather_config(),
+            stages={"weather": partial_stage},
+            verifier=_passing_verifier,
+            sources={"weather"},
+        )
+
+        self.assertEqual(code, ro.EXIT_STAGE_FAILED)
+        marks = etl_audit.get_watermarks("weather")
+        self.assertNotIn(
+            airport_a, marks,
+            "a PARTIAL weather stage must not advance any watermark",
+        )
+        self.assertNotIn(
+            airport_b, marks,
+            "a PARTIAL weather stage must not advance any watermark",
+        )
+
     def test_watermark_not_advanced_when_stage_fails(self):
         airport_a, _ = self._seed_airports_and_flights()
 

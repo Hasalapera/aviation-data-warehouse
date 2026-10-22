@@ -732,7 +732,7 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
     weather_status = (results.get("weather") or {}).get("status")
     if (
         (config.get("weather_incremental") or {}).get("enabled")
-        and weather_status in ("SUCCESS", "PARTIAL")
+        and weather_status == "SUCCESS"
         and verification_ran
         and verify_ok
     ):
@@ -751,7 +751,7 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
             return EXIT_AUDIT_FINISH
     elif weather_status and (
         config.get("weather_incremental") or {}
-    ).get("enabled") and weather_status in ("SUCCESS", "PARTIAL"):
+    ).get("enabled") and weather_status == "SUCCESS":
         if not verification_ran:
             print(
                 " -> weather watermarks NOT advanced: verification was "
