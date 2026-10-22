@@ -16,7 +16,7 @@ Guarantees
   may already be committed.
 * Post-load verification (verify_warehouse.py, read-only) runs after the
   stages; failures there exit 6 and prevent watermark advancement.
-* Watermarks (weather, opt-in) advance only after the stage transaction
+* Watermarks (weather, config-driven) advance only after the stage transaction
   committed AND verification actually ran and did not fail. Skipping
   verification (--no-verify / run_verification=false) suppresses watermark
   advancement entirely.
@@ -86,38 +86,95 @@ EXIT_INTERRUPTED = 130
 # CONFIG
 # =========================================================
 
+def _config_bool(value, label):
+    """Reject JSON truthiness traps (e.g. "false", 1) at load time."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def _config_int(value, label, minimum):
+    """Accept only real JSON integers, never bools/strings/floats."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    if value < minimum:
+        qualifier = "positive" if minimum == 1 else "zero or greater"
+        raise ValueError(f"{label} must be {qualifier}")
+    return value
+
+
 def load_config(path=None):
     path = path or DEFAULT_CONFIG
     with open(path, "r", encoding="utf-8") as handle:
         config = json.load(handle)
+
     order = config.get("order") or ["csv", "weather", "oltp"]
+    if not isinstance(order, list) or not all(
+        isinstance(name, str) and name for name in order
+    ):
+        raise ValueError("order must be a list of source names")
+    unknown = set(order) - {"csv", "weather", "oltp"}
+    if unknown:
+        raise ValueError(f"unknown source(s) in order: {sorted(unknown)}")
+    config["order"] = order
+
     sources = config.setdefault("sources", {})
+    if not isinstance(sources, dict):
+        raise ValueError("sources must be an object")
     for name in order:
-        sources.setdefault(name, {"enabled": True, "required": True})
-    config.setdefault("lock_timeout_seconds", 0)
-    config.setdefault("stale_running_minutes", 240)
-    config.setdefault("run_verification", True)
-    config.setdefault("verification_fails_run", True)
-    config.setdefault("csv_path", "data/flight.csv")
-    config.setdefault("weather_chunk_size", 1000)
-    config.setdefault("weather_incremental", {"enabled": False, "overlap_days": 7})
-    if int(config["weather_chunk_size"]) <= 0:
-        raise ValueError("weather_chunk_size must be positive")
-    if int(config["stale_running_minutes"]) <= 0:
-        raise ValueError("stale_running_minutes must be positive")
-    incremental = config["weather_incremental"]
+        entry = sources.setdefault(name, {})
+        if not isinstance(entry, dict):
+            raise ValueError(f"sources.{name} must be an object")
+        entry.setdefault("enabled", True)
+        entry.setdefault("required", True)
+        entry["enabled"] = _config_bool(
+            entry["enabled"], f"sources.{name}.enabled"
+        )
+        entry["required"] = _config_bool(
+            entry["required"], f"sources.{name}.required"
+        )
+
+    config["lock_timeout_seconds"] = _config_int(
+        config.get("lock_timeout_seconds", 0),
+        "lock_timeout_seconds",
+        0,
+    )
+    config["stale_running_minutes"] = _config_int(
+        config.get("stale_running_minutes", 240),
+        "stale_running_minutes",
+        1,
+    )
+    config["run_verification"] = _config_bool(
+        config.get("run_verification", True), "run_verification"
+    )
+    config["verification_fails_run"] = _config_bool(
+        config.get("verification_fails_run", True),
+        "verification_fails_run",
+    )
+    csv_path = config.get("csv_path", "data/flight.csv")
+    if not isinstance(csv_path, str) or not csv_path:
+        raise ValueError("csv_path must be a non-empty string")
+    config["csv_path"] = csv_path
+    config["weather_chunk_size"] = _config_int(
+        config.get("weather_chunk_size", 1000),
+        "weather_chunk_size",
+        1,
+    )
+
+    incremental = config.get("weather_incremental", {})
     if not isinstance(incremental, dict):
         raise ValueError("weather_incremental must be an object")
-    try:
-        overlap_days = int(incremental.get("overlap_days", 7))
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            "weather_incremental.overlap_days must be an integer"
-        ) from error
-    if overlap_days < 0:
-        raise ValueError(
-            "weather_incremental.overlap_days must be zero or greater"
-        )
+    incremental.setdefault("enabled", False)
+    incremental.setdefault("overlap_days", 7)
+    incremental["enabled"] = _config_bool(
+        incremental["enabled"], "weather_incremental.enabled"
+    )
+    incremental["overlap_days"] = _config_int(
+        incremental["overlap_days"],
+        "weather_incremental.overlap_days",
+        0,
+    )
+    config["weather_incremental"] = incremental
     return config
 
 
@@ -249,7 +306,7 @@ def _weather_partial_note(captured):
 
 
 # =========================================================
-# WEATHER WATERMARKS (P2 - opt-in, per-airport windows)
+# WEATHER WATERMARKS (config-driven, per-airport windows)
 # =========================================================
 
 def _overlap_days(config):
@@ -850,8 +907,28 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
     if verify and config.get("run_verification", True):
         verification_ran = True
         try:
+            info = etl_audit.start_run("verify", batch_guid)
+        except etl_audit.AuditError as error:
+            print(
+                f"\n[FATAL][EXIT {EXIT_AUDIT_START}] cannot audit verification "
+                f"start (verification not run): {error}"
+            )
+            _print_summary(results, batch_guid, started, aborted=True)
+            return EXIT_AUDIT_START
+
+        verify_error = None
+        try:
             verify_checks = _run_verification(verifier)
         except KeyboardInterrupt:
+            try:
+                etl_audit.finish_run(
+                    info["run_id"],
+                    "FAILED",
+                    notes="verification interrupted by operator",
+                    error="interrupted by operator (Ctrl-C)",
+                )
+            except etl_audit.AuditError:
+                pass  # row stays RUNNING; stale detection reports it
             _print_summary(results, batch_guid, started, aborted=True)
             print(
                 f"\n[INTERRUPTED][EXIT {EXIT_INTERRUPTED}] operator interrupt "
@@ -861,33 +938,37 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
         except Exception as error:
             verify_checks = None
             verify_ok = False
-            print(f"[!] verification could not complete: {error}")
+            verify_error = f"verification could not complete: {error}"
+            print(f"[!] {verify_error}")
         else:
             verify_ok = not any(c.status == "FAIL" for c in verify_checks)
-        # audit the verification attempt itself
-        info = None
+
+        if verify_checks is None:
+            verify_notes = "post-load verification could not complete"
+        else:
+            verify_notes = (
+                "post-load verification "
+                + ("passed" if verify_ok else "reported FAIL checks")
+            )
         try:
-            info = etl_audit.start_run("verify", batch_guid)
             etl_audit.finish_run(
                 info["run_id"],
                 "SUCCESS" if verify_ok else "FAILED",
-                notes=(
-                    "post-load verification "
-                    + ("passed" if verify_ok else "reported FAIL checks")
+                notes=verify_notes,
+                error=None if verify_ok else (
+                    verify_error or "one or more checks FAILED"
                 ),
-                error=None if verify_ok else "one or more checks FAILED",
             )
         except KeyboardInterrupt:
-            if info is not None:
-                try:
-                    etl_audit.finish_run(
-                        info["run_id"],
-                        "FAILED",
-                        notes="verification interrupted by operator",
-                        error="interrupted by operator (Ctrl-C)",
-                    )
-                except etl_audit.AuditError:
-                    pass  # row stays RUNNING; stale detection reports it
+            try:
+                etl_audit.finish_run(
+                    info["run_id"],
+                    "FAILED",
+                    notes="verification interrupted by operator",
+                    error="interrupted by operator (Ctrl-C)",
+                )
+            except etl_audit.AuditError:
+                pass  # row stays RUNNING; stale detection reports it
             _print_summary(results, batch_guid, started, aborted=True)
             print(f"\n[INTERRUPTED][EXIT {EXIT_INTERRUPTED}] operator interrupt")
             return EXIT_INTERRUPTED

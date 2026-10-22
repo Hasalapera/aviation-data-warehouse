@@ -24,6 +24,7 @@ import io
 import os
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -188,6 +189,148 @@ class TestOltpEtlRegression(unittest.TestCase):
                 "AND weather_key IS NOT NULL"
             ),
             0,
+        )
+
+
+class TestWeatherPersistence(unittest.TestCase):
+    """Real weather_etl persistence path with mocked external APIs.
+
+    These tests never call Open-Meteo/IEM and never touch a production
+    database: they exercise _upsert_weather and run_weather_etl end to end
+    against the disposable warehouse.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        dbutil.recreate_schema()
+
+    def setUp(self):
+        from database import dw_engine
+
+        with dw_engine.begin() as conn:
+            conn.execute(text("DELETE FROM dim_weather"))
+            conn.execute(text(
+                "INSERT IGNORE INTO dim_airport "
+                "(airport_code, airport_name) VALUES ('CMB', 'Colombo')"
+            ))
+            self.airport_key = conn.execute(text(
+                "SELECT airport_key FROM dim_airport WHERE airport_code='CMB'"
+            )).scalar()
+
+    @staticmethod
+    def _archive_frame(temperature):
+        import pandas as pd
+
+        return pd.DataFrame({
+            "time": pd.to_datetime([
+                "2024-03-01 00:00:00",
+                "2024-03-01 01:00:00",
+            ]),
+            "temperature_2m": [temperature, temperature],
+            "relative_humidity_2m": [60.0, 61.0],
+            "precipitation": [0.0, 0.0],
+            "wind_speed_10m": [5.0, 6.0],
+            "cloud_cover": [10.0, 20.0],
+            "weather_code": [0, 1],
+        })
+
+    @staticmethod
+    def _weather_frame(airport_key, temperature):
+        import pandas as pd
+
+        return pd.DataFrame({
+            "airport_key": [airport_key],
+            "observation_time": pd.to_datetime(["2024-03-01 00:00:00"]),
+            "temperature": [temperature],
+            "rainfall": [0.0],
+            "wind_speed": [5.0],
+            "visibility": [10.0],
+            "relative_humidity": [60.0],
+            "cloud_cover": [10.0],
+            "weather_code": [0],
+            "weather_condition": ["Clear"],
+            "visibility_source": ["noaa-isd-metar"],
+            "source_dataset": ["open-meteo-archive"],
+            "source_model": ["best_match"],
+            "source_timezone": ["Asia/Colombo"],
+        })
+
+    def _run_weather(self, temperature):
+        import pandas as pd
+
+        import weather_etl
+
+        flights = pd.DataFrame({
+            "source_system": ["csv"],
+            "source_flight_id": ["mocked-1"],
+            "scheduled_departure": pd.to_datetime(["2024-03-01 10:00:00"]),
+            "airport_code": ["CMB"],
+        })
+        calls = []
+
+        def fake_archive(code, info, start_date, end_date):
+            calls.append((code, start_date, end_date))
+            return self._archive_frame(temperature)
+
+        empty_visibility = pd.DataFrame(columns=["time", "visibility_km"])
+        with mock.patch.object(
+            weather_etl, "_read_flights", return_value=flights
+        ), mock.patch.object(
+            weather_etl, "_read_airport_keys",
+            return_value={"CMB": self.airport_key},
+        ), mock.patch.object(
+            weather_etl, "fetch_archive_weather", side_effect=fake_archive
+        ), mock.patch.object(
+            weather_etl, "fetch_iem_visibility", return_value=empty_visibility
+        ), contextlib.redirect_stdout(io.StringIO()):
+            weather_etl.run_weather_etl()
+        return calls
+
+    def _weather_rows(self):
+        from database import dw_engine
+
+        with dw_engine.connect() as conn:
+            return conn.execute(text(
+                "SELECT temperature, source_timezone FROM dim_weather "
+                "WHERE airport_key=:k ORDER BY observation_time"
+            ), {"k": self.airport_key}).fetchall()
+
+    def test_mocked_end_to_end_upsert_is_idempotent_and_updates_values(self):
+        calls = self._run_weather(25.0)
+        self.assertEqual(calls, [("CMB", "2024-03-01", "2024-03-01")])
+        rows = self._weather_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([float(r[0]) for r in rows], [25.0, 25.0])
+        self.assertEqual({r[1] for r in rows}, {"Asia/Colombo"})
+
+        self._run_weather(31.0)
+        rows = self._weather_rows()
+        self.assertEqual(len(rows), 2, "re-running must not create duplicates")
+        self.assertEqual(
+            [float(r[0]) for r in rows], [31.0, 31.0],
+            "same identity must update weather values in place",
+        )
+
+    def test_upsert_failure_rolls_back_the_whole_batch(self):
+        import weather_etl
+        from database import dw_engine
+
+        rows = __import__("pandas").concat(
+            [
+                self._weather_frame(self.airport_key, 25.0),
+                self._weather_frame(999999, 25.0),
+            ],
+            ignore_index=True,
+        )
+        with mock.patch.object(weather_etl, "INSERT_CHUNK_SIZE", 1):
+            with self.assertRaises(Exception):
+                with dw_engine.begin() as conn:
+                    weather_etl._upsert_weather(conn, rows)
+
+        self.assertEqual(
+            _count("SELECT COUNT(*) FROM dim_weather"), 0,
+            "a failed chunk must roll back earlier chunks in the same "
+            "transaction",
         )
 
 

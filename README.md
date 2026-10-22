@@ -16,7 +16,7 @@ and six dimensions/facts served to Power BI through 25 analytical queries
 | `verify_warehouse.py` | Read-only post-load verification |
 | `etl_audit.py`, `sql/audit_schema.sql` | Audit log / run lock / watermarks (additive tables) |
 | `oltp_change_updater.py` | Opt-in bounded OLTP change updates (`--enable-changes`) |
-| `config/refresh_policy.json` | Refresh policy settings (defaults = original behaviour) |
+| `config/refresh_policy.json` | Refresh policy settings (incremental weather enabled; set false for full-range) |
 | `scripts/query_checksum.py` | Before/after query SQL + result checksums |
 | `scripts/scheduled_refresh.sh`, `scripts/launchd/` | Optional scheduling (disabled by default) |
 | `tests/` | unittest suite (runs against disposable `aviation_dw_ci`) |

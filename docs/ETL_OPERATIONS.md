@@ -58,25 +58,27 @@ Exit codes: `0` ok, `1` required stage failed, `2` preflight, `3` locked,
 advancement check failed after stage (data may be committed), `6`
 verification failed, `130` interrupted by operator.
 
-## Incremental weather mode (opt-in)
+## Incremental weather mode (enabled by policy)
 
 Incremental weather is controlled **only** by
 `config/refresh_policy.json`:
 
 ```json
-"weather_incremental": { "enabled": false, "overlap_days": 7 }
+"weather_incremental": { "enabled": true, "overlap_days": 7 }
 ```
 
-- `enabled: false` (default) preserves the original full-range fetch
-  exactly; no per-airport override is passed to `weather_etl.py`.
-- `enabled: true` makes each airport fetch from
+- `enabled: true` (shipped) makes each airport fetch from
   `its own watermark date - overlap_days`, clamped to its first flight.
   Airports without a watermark fetch their full available history.
+- `enabled: false` restores the original full-range fetch exactly; no
+  per-airport override is passed to `weather_etl.py`.
 - Enable/disable is a config edit; it does not itself start a refresh.
   Run `--dry-run` first, then a normal audited run.
-- `overlap_days` must be `>= 0`. The overlap deliberately re-fetches recent
-  days so late archive corrections are picked up; it is not a completeness
-  margin for older data.
+- `enabled` must be a real JSON boolean and `overlap_days` must be an
+  integer `>= 0`; ill-typed values fail config loading with exit `2`.
+  The overlap deliberately re-fetches recent days so late archive
+  corrections are picked up; it is not a completeness margin for older
+  data.
 - A watermark only advances when that airport's persisted observations
   cover every calendar day of its expected window and verification passed.
   Inspect progress and withheld airports with:
@@ -93,20 +95,19 @@ ORDER BY window_key;
   no watermark moves for that run. Fix the cause and rerun; incomplete
   airports are re-covered automatically.
 
-Rollout status: the implementation is covered by deterministic tests
-(including partial fetches and coverage gaps), but the shipped default
-remains `enabled: false`. It has not yet been validated against a real
-Open-Meteo archive run across all production airports, so enabling it
-should be a deliberate operator decision after a monitored full-range /
-incremental dry run and a first audited observation of watermark
-advancement.
+Rollout status: the implementation is covered by the full CI suite
+(including partial fetches, mocked end-to-end upsert/rollback, and
+coverage gaps), and read-only Open-Meteo/IEM validation succeeded for all
+eight configured airports on a bounded three-day window. The shipped
+policy has `enabled: true`. A first run with no existing watermarks still
+fetches full history; enablement does not itself start a refresh.
 
-### First enablement and monitoring
+### First production incremental run and monitoring
 
 1. Take a backup before the first run
    (`venv/bin/python setup_database.py backup`).
-2. Set `weather_incremental.enabled` to `true` and confirm
-   `overlap_days` is an integer `>= 0`.
+2. Confirm `weather_incremental.enabled` is `true` and `overlap_days` is
+   an integer `>= 0`.
 3. Run `venv/bin/python refresh_orchestrator.py --dry-run`; require exit
    `0` and `incremental weather: ON`. The dry run does not execute a
    stage, take the lock, or write audit rows.

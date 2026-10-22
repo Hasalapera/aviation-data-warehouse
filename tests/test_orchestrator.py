@@ -361,6 +361,79 @@ class TestOrchestrator(unittest.TestCase):
         lock.release()
 
 
+class TestConfigValidation(unittest.TestCase):
+    """Ill-typed policy values must fail at load time, never silently change
+    refresh behaviour (e.g. string "false" becoming truthy)."""
+
+    def _load(self, mutate):
+        import json
+        import tempfile
+
+        config = _fresh_config()
+        mutate(config)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False
+        ) as handle:
+            json.dump(config, handle)
+            path = handle.name
+        try:
+            return ro.load_config(path)
+        finally:
+            os.unlink(path)
+
+    def test_rejects_non_boolean_incremental_enabled(self):
+        for value in ("false", 0, 1, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self._load(
+                        lambda config, value=value: config[
+                            "weather_incremental"
+                        ].__setitem__("enabled", value)
+                    )
+
+    def test_rejects_non_integer_overlap_days(self):
+        for value in ("7", 7.0, True, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self._load(
+                        lambda config, value=value: config[
+                            "weather_incremental"
+                        ].__setitem__("overlap_days", value)
+                    )
+
+    def test_rejects_non_boolean_stage_and_run_flags(self):
+        for key in ("run_verification", "verification_fails_run"):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    self._load(lambda config, key=key: config.__setitem__(
+                        key, "false"
+                    ))
+        with self.assertRaises(ValueError):
+            self._load(lambda config: config["sources"]["weather"].__setitem__(
+                "enabled", "false"
+            ))
+
+    def test_rejects_non_integer_numeric_settings(self):
+        for key, value in (
+            ("weather_chunk_size", "500"),
+            ("weather_chunk_size", True),
+            ("lock_timeout_seconds", 1.5),
+            ("stale_running_minutes", False),
+        ):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ValueError):
+                    self._load(lambda config, key=key, value=value:
+                               config.__setitem__(key, value))
+
+    def test_missing_incremental_section_defaults_to_disabled(self):
+        def remove(config):
+            config.pop("weather_incremental")
+
+        config = self._load(remove)
+        self.assertIs(config["weather_incremental"]["enabled"], False)
+        self.assertEqual(config["weather_incremental"]["overlap_days"], 7)
+
+
 class TestReadOnlyModesAndInterruption(unittest.TestCase):
     """Regression tests for the safety audit fixes:
 
@@ -438,6 +511,76 @@ class TestReadOnlyModesAndInterruption(unittest.TestCase):
         lock = etl_audit.acquire_run_lock(timeout=0)
         self.assertIsNotNone(lock, "lock must be released after interrupt")
         lock.release()
+
+    def test_verification_audit_row_is_running_during_checks(self):
+        seen = []
+
+        def verifier(conn):
+            from database import dw_engine
+
+            with dw_engine.connect() as audit_conn:
+                status = audit_conn.execute(
+                    text(
+                        "SELECT status FROM etl_batch_log "
+                        "WHERE source_name='verify' ORDER BY run_id DESC "
+                        "LIMIT 1"
+                    )
+                ).scalar()
+            seen.append(status)
+            return [verify_warehouse.Check("stub", "PASS", "ok")]
+
+        stages, _ = _stub_stages()
+        code = ro.run_refresh(
+            _fresh_config(), stages=stages, verifier=verifier,
+            sources={"csv"},
+        )
+        self.assertEqual(code, ro.EXIT_OK)
+        self.assertEqual(
+            seen, ["RUNNING"],
+            "the verify audit row must exist before checks execute so a "
+            "crash during verification still leaves an auditable attempt",
+        )
+        self.assertIn(("verify", "SUCCESS"), [(r[0], r[1]) for r in self._runs()])
+
+    def test_verification_audit_start_failure_prevents_checks(self):
+        called = []
+
+        def verifier(conn):
+            called.append(True)
+            return [verify_warehouse.Check("stub", "PASS", "ok")]
+
+        original_start = etl_audit.start_run
+
+        def start(source_name, batch_guid=None):
+            if source_name == "verify":
+                raise etl_audit.AuditError("verify audit unavailable")
+            return original_start(source_name, batch_guid)
+
+        stages, _ = _stub_stages()
+        with mock.patch.object(etl_audit, "start_run", side_effect=start):
+            code = ro.run_refresh(
+                _fresh_config(), stages=stages, verifier=verifier,
+                sources={"csv"},
+            )
+        self.assertEqual(code, ro.EXIT_AUDIT_START)
+        self.assertEqual(called, [], "verification must not run without audit")
+        self.assertNotIn("verify", [r[0] for r in self._runs()])
+
+    def test_verifier_exception_is_audited_as_failed(self):
+        def broken_verifier(conn):
+            raise RuntimeError("verifier exploded")
+
+        stages, _ = _stub_stages()
+        code = ro.run_refresh(
+            _fresh_config(), stages=stages, verifier=broken_verifier,
+            sources={"csv"},
+        )
+        self.assertEqual(code, ro.EXIT_VERIFY_FAILED)
+        rows = self._runs()
+        verify_rows = [r for r in rows if r[0] == "verify"]
+        self.assertEqual(len(verify_rows), 1)
+        self.assertEqual(verify_rows[0][1], "FAILED")
+        self.assertIn("could not complete", verify_rows[0][3] or "")
 
     def test_config_stale_running_minutes_is_passed_to_verifier(self):
         config = _fresh_config()

@@ -1,6 +1,6 @@
 {
   "policy_version": 1,
-  "comment": "Data Refresh Policy configuration. Defaults preserve existing ETL behaviour exactly: all stages enabled+required, weather chunk size 1000 (=weather_etl.INSERT_CHUNK_SIZE), incremental weather OFF.",
+  "comment": "Data Refresh Policy configuration. All stages enabled+required; weather chunk size 1000 (=weather_etl.INSERT_CHUNK_SIZE); incremental weather ON after safety validation (set weather_incremental.enabled=false to restore full-range fetching).",
   "order": ["csv", "weather", "oltp"],
   "sources": {
     "csv":    { "enabled": true, "required": true },
@@ -15,8 +15,8 @@
   "csv_path": "data/flight.csv",
   "weather_chunk_size": 1000,
   "weather_incremental": {
-    "enabled": false,
+    "enabled": true,
     "overlap_days": 7,
-    "comment": "When enabled, fetches weather from (per-airport watermark - overlap_days) instead of full flight history. OFF by default: existing full-range upsert behaviour is preserved. Watermarks are written only after a successful stage + verification."
+    "comment": "Enabled in the shipped policy after the safety audit. Fetches weather from (per-airport watermark - overlap_days) instead of full flight history; set enabled=false to restore full-range fetching. Watermarks are written only after a successful stage + verification."
   }
 }

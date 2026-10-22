@@ -41,7 +41,7 @@ approach was chosen, and the guarantees every refresh must uphold.
 | Source | Method | Incremental? | Rationale |
 |---|---|---|---|
 | CSV (`data/flight.csv`) | Full load, **insert-only** | No | Static snapshot file, no change feed. Existing rows are skipped by identity `(source_system, source_flight_id)`; nothing is ever updated or deleted (`etl.py` skip-if-exists). Re-running is a no-op (proven by `tests/test_etl_regression.py`). |
-| Weather archive | Full range on first run, then **incremental window** (opt-in, default OFF) | Yes (opt-in) | 86k+ observations; incremental needs overlap to catch late corrections. Design below. |
+| Weather archive | Full range on first run, then **incremental window** (enabled; opt-out) | Yes | 86k+ observations; incremental needs overlap to catch late corrections. Design below. |
 | OLTP (Aiven `flights`) | **Full refresh, insert-only** | No | Incremental was evaluated and **rejected with evidence** (below). |
 
 ### OLTP incremental: rejected with evidence
@@ -62,11 +62,12 @@ opt-in change updater (`--enable-changes`) exists for operators who need
 mutable-attribute corrections (P2, see below); deletion sync is explicitly
 out of policy.
 
-### Weather incremental design (opt-in, default OFF)
+### Weather incremental design (enabled by policy)
 
-Config: `weather_incremental = {"enabled": false, "overlap_days": 7}`.
-`overlap_days` must be an integer `>= 0`; invalid values fail config
-loading (exit `2`) instead of silently using a different window.
+Config: `weather_incremental = {"enabled": true, "overlap_days": 7}`.
+`overlap_days` must be an integer `>= 0` and `enabled` must be a real
+JSON boolean; invalid values fail config loading (exit `2`) instead of
+silently using a different window or accidentally activating the mode.
 
 - Watermarks are per origin airport, stored in `etl_watermark`
   (`window_key = airport_code`, `watermark_value = MAX(observation_time)`
@@ -109,11 +110,14 @@ loading (exit `2`) instead of silently using a different window.
   (`airports failed : [...]`); if that format changes, the independent
   coverage check remains the safety net and withholds incomplete airports.
 
-Current rollout: `weather_incremental.enabled` stays **false** in the
-shipped policy. The safety rules above are implemented and unit-tested,
-but they have not yet been exercised against a real archive refresh for
-every production airport. Enablement is therefore an explicit operator
-decision (see `docs/ETL_OPERATIONS.md`).
+Current rollout: `weather_incremental.enabled` is **true** in the shipped
+policy after the safety audit. The rules above are covered by the full CI
+suite, including mocked end-to-end upsert/rollback tests, and read-only
+Open-Meteo/IEM validation succeeded for all eight configured airports
+(CMB, DXB, SIN, LHR, KUL, DEL, DOH, BOM; 2024-06-01..03). A first
+production run with no existing watermarks still fetches full history and
+then establishes per-airport watermarks. To roll back, set
+`weather_incremental.enabled=false` (see `docs/ETL_OPERATIONS.md`).
 
 ### OLTP bounded change updater (opt-in, default OFF)
 

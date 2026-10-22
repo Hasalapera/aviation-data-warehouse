@@ -124,6 +124,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
     def test_incremental_off_always_returns_none(self):
         etl_audit.record_watermark("weather", "CMBB", "2024-03-05 00:00:00")
         config = _fresh_config()
+        config["weather_incremental"]["enabled"] = False
         self.assertIsNone(ro.weather_start_overrides(config))
 
     def test_incremental_on_without_watermarks_returns_none(self):
