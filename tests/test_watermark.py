@@ -106,7 +106,20 @@ def _seed_fixture_flight(fixture):
 class TestWeatherWatermarkLogic(unittest.TestCase):
     FAKE_AIRPORTS = {
         code: {"lat": 0.0, "lon": 0.0, "tz": "UTC", "icao": code}
-        for code in ("WTOA", "WTWB", "WTCA", "WTCB", "WTCC", "WTCD")
+        for code in (
+            "WTOA", "WTWB", "WTCA", "WTCB", "WTCC", "WTCD", "WTCF",
+            "WTC1", "WTC2", "WTC3", "WTC4", "WTC5", "WTCP", "WTCX",
+            "WTCY", "WTCH", "WTCDUP",
+        )
+    }
+    FAKE_AIRPORTS["WTSF"] = {
+        "lat": 51.4700, "lon": -0.4543, "tz": "Europe/London", "icao": "EGLL"
+    }
+    FAKE_AIRPORTS["WTFB"] = {
+        "lat": 51.4700, "lon": -0.4543, "tz": "Europe/London", "icao": "EGLL"
+    }
+    FAKE_AIRPORTS["WTCO"] = {
+        "lat": 6.9271, "lon": 79.8612, "tz": "Asia/Colombo", "icao": "VCBI"
     }
 
     @classmethod
@@ -153,6 +166,28 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         self.assertNotEqual(
             overrides["CMBB"], overrides["KEAA"],
             "a single global window would give both airports the same start",
+        )
+
+    def test_utc_watermark_start_override_uses_airport_local_date(self):
+        import weather_etl
+
+        airport = "WTCE"
+        weather_etl.AIRPORT_INFO[airport] = {
+            "lat": 6.9271, "lon": 79.8612,
+            "tz": "Asia/Colombo", "icao": "VCBI",
+        }
+        etl_audit.record_watermark(
+            "weather", airport, "2024-06-03 20:00:00Z"
+        )
+
+        config = _fresh_config()
+        config["weather_incremental"]["enabled"] = True
+
+        self.assertEqual(
+            ro.weather_start_overrides(config),
+            {airport: date(2024, 5, 28)},
+            "UTC watermark must be converted to the airport local date before "
+            "subtracting the overlap",
         )
 
     def test_zero_overlap_uses_the_watermark_date(self):
@@ -480,6 +515,111 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
             "persisted maximum (2024-06-10) must not be used",
         )
 
+    def test_legacy_rows_cannot_mask_utc_coverage_gap(self):
+        airport = self._seed_airport_series(
+            "WTCA",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[
+                date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3)
+            ],
+        )
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[date(2024, 6, 1)],
+            source_model="best_match_utc_v1",
+        )
+
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-mixed-gap", _fresh_config()
+        )
+
+        self.assertIn(airport, held)
+        self.assertIn("incomplete persisted coverage", held[airport])
+        self.assertNotIn(airport, advanced)
+        self.assertNotIn(airport, etl_audit.get_watermarks("weather"))
+
+    def test_utc_rows_outside_window_still_force_utc_basis(self):
+        airport = self._seed_airport_series(
+            "WTCF",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[
+                date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3)
+            ],
+        )
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[date(2024, 1, 1)],
+            source_model="best_match_utc_v1",
+        )
+
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-utc-outside-window", _fresh_config()
+        )
+
+        self.assertIn(airport, held)
+        self.assertIn("in the UTC model", held[airport])
+        self.assertNotIn(airport, advanced)
+        self.assertNotIn(airport, etl_audit.get_watermarks("weather"))
+
+    def test_utc_coverage_advances_with_utc_watermark_basis(self):
+        airport = self._seed_airport_series(
+            "WTCB",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[date(2024, 6, 1)],
+        )
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[
+                date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3)
+            ],
+            source_model="best_match_utc_v1",
+            hourly=True,
+        )
+
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-utc-complete", _fresh_config()
+        )
+
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        mark = etl_audit.get_watermarks("weather")[airport]
+        self.assertEqual(mark, "2024-06-03 23:00:00Z")
+
+    def test_legacy_local_watermark_is_compared_in_utc(self):
+        import weather_etl
+
+        airport = "WTCE"
+        weather_etl.AIRPORT_INFO[airport] = {
+            "lat": 6.9271, "lon": 79.8612,
+            "tz": "Asia/Colombo", "icao": "VCBI",
+        }
+        expected_instants = ro.generate_expected_utc_instants(
+            date(2024, 6, 1), date(2024, 6, 3), "Asia/Colombo"
+        )
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=expected_instants,
+        )
+        etl_audit.record_watermark(
+            "weather", airport, "2024-06-03 20:00:00"
+        )
+
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-local-to-utc", _fresh_config()
+        )
+
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2024-06-03 17:30:00Z",
+        )
     def test_watermark_never_moves_backwards_when_window_shrinks(self):
         airport = self._seed_airport_series(
             "WTCD",
@@ -528,6 +668,341 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
             )).fetchall()
         self.assertEqual([row[0] for row in runs], ["SUCCESS", "SUCCESS"])
 
+    # ---------- full-span UTC coverage verification gate ----------
+
+    def test_full_span_coverage_succeeds_only_when_entire_utc_range_present(self):
+        airport_a = self._seed_airport_series(
+            "WTC1",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[
+                date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3)
+            ],
+            source_model="best_match_utc_v1",
+            hourly=True,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-full-span", _fresh_config()
+        )
+        self.assertIn(airport_a, advanced)
+        self.assertNotIn(airport_a, held)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport_a],
+            "2024-06-03 23:00:00Z",
+        )
+
+        # Case B: Omit an interior hour
+        instants_71 = ro.generate_expected_utc_instants(
+            date(2024, 6, 1), date(2024, 6, 3), "UTC"
+        )
+        missing_instant = instants_71.pop(35)
+        airport_b = self._seed_airport_series(
+            "WTC2",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=instants_71,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-interior-gap", _fresh_config()
+        )
+        self.assertIn(airport_b, held)
+        self.assertNotIn(airport_b, advanced)
+        self.assertIn("incomplete persisted coverage", held[airport_b])
+        self.assertIn(str(missing_instant), held[airport_b])
+
+    def test_missing_early_historical_day_blocks_advancement_even_if_latest_seven_days_complete(self):
+        flight_dates = [date(2024, 6, 1) + timedelta(days=i) for i in range(10)]
+        obs_dates = [date(2024, 6, 4) + timedelta(days=i) for i in range(7)]
+        airport = self._seed_airport_series(
+            "WTC3",
+            flight_dates=flight_dates,
+            observation_dates=obs_dates,
+            source_model="best_match_utc_v1",
+            hourly=True,
+        )
+        config = _fresh_config()
+        config["weather_incremental"]["enabled"] = True
+        config["weather_incremental"]["overlap_days"] = 7
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-early-gap", config
+        )
+        self.assertIn(airport, held)
+        self.assertNotIn(airport, advanced)
+        self.assertIn("incomplete persisted coverage", held[airport])
+        self.assertIn("2024-06-01", held[airport])
+
+    def test_legacy_rows_cannot_satisfy_utc_coverage(self):
+        airport = self._seed_airport_series(
+            "WTC4",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[date(2024, 6, 1)],
+            source_model="best_match",
+            hourly=True,
+        )
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[date(2024, 6, 2), date(2024, 6, 3)],
+            source_model="best_match_utc_v1",
+            hourly=True,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-legacy-mask-full", _fresh_config()
+        )
+        self.assertIn(airport, held)
+        self.assertNotIn(airport, advanced)
+        self.assertIn("incomplete persisted coverage", held[airport])
+        self.assertIn("2024-06-01", held[airport])
+
+    def test_legacy_watermark_ahead_of_utc_time_cannot_bypass_verification(self):
+        airport = self._seed_airport_series(
+            "WTC5",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 10)],
+            observation_dates=[
+                date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3)
+            ],
+            source_model="best_match_utc_v1",
+            hourly=True,
+        )
+        etl_audit.record_watermark("weather", airport, "2024-06-20 12:00:00")
+
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-ahead-watermark", _fresh_config()
+        )
+        self.assertIn(airport, held)
+        self.assertNotIn(airport, advanced)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2024-06-20 12:00:00",
+        )
+
+    def test_dst_spring_forward_boundary(self):
+        airport = "WTSF"
+        expected = ro.generate_expected_utc_instants(
+            date(2025, 3, 30), date(2025, 3, 30), "Europe/London"
+        )
+        self.assertEqual(len(expected), 23)
+
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2025, 3, 30)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=expected,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-dst-spring", _fresh_config()
+        )
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2025-03-30 22:00:00Z",
+        )
+
+    def test_dst_fall_back_boundary(self):
+        airport = "WTFB"
+        expected = ro.generate_expected_utc_instants(
+            date(2025, 10, 26), date(2025, 10, 26), "Europe/London"
+        )
+        self.assertEqual(len(expected), 25)
+
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2025, 10, 26)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=expected,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-dst-fall", _fresh_config()
+        )
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2025-10-26 23:00:00Z",
+        )
+
+    def test_half_hour_timezone_offsets(self):
+        airport = "WTCO"
+        expected = ro.generate_expected_utc_instants(
+            date(2025, 1, 9), date(2025, 1, 9), "Asia/Colombo"
+        )
+        self.assertEqual(len(expected), 24)
+        for t in expected:
+            self.assertEqual(t.minute, 30)
+
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2025, 1, 9)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=expected,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-half-hour", _fresh_config()
+        )
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2025-01-09 17:30:00Z",
+        )
+
+    def test_duplicate_utc_instants_block_advancement(self):
+        instants = ro.generate_expected_utc_instants(
+            date(2024, 6, 1), date(2024, 6, 1), "UTC"
+        )
+        fake_rows = [
+            (t, "best_match_utc_v1", 2 if i == 5 else 1)
+            for i, t in enumerate(instants)
+        ]
+        mock_conn = mock.MagicMock()
+        mock_conn.execute.return_value.fetchall.return_value = fake_rows
+        gate = ro.verify_utc_weather_coverage(
+            mock_conn, "WTCDUP", date(2024, 6, 1), date(2024, 6, 1), "UTC"
+        )
+        self.assertFalse(gate.passed)
+        self.assertIn("duplicate UTC instants detected", gate.reason)
+        self.assertEqual(gate.duplicate_count, 1)
+
+    def test_missing_provider_data_and_incomplete_archive_responses(self):
+        airport = "WTCP"
+        partial_instants = ro.generate_expected_utc_instants(
+            date(2024, 6, 1), date(2024, 6, 1), "UTC"
+        )[:12]
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=partial_instants,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-provider-truncated", _fresh_config()
+        )
+        self.assertIn(airport, held)
+        self.assertNotIn(airport, advanced)
+        self.assertIn("incomplete persisted coverage", held[airport])
+        self.assertIn("12 observation(s) missing", held[airport])
+
+    def test_wrong_source_models_and_invalid_timestamps(self):
+        from database import dw_engine
+
+        airport_x = self._seed_airport_series(
+            "WTCX",
+            flight_dates=[date(2024, 6, 1)],
+            observation_dates=[date(2024, 6, 1)],
+            source_model="reanalysis_v1",
+            hourly=True,
+        )
+        with dw_engine.connect() as conn:
+            gate_x = ro.verify_utc_weather_coverage(
+                conn, airport_x, date(2024, 6, 1), date(2024, 6, 1), "UTC"
+            )
+        self.assertFalse(gate_x.passed)
+        self.assertIn("in the UTC model", gate_x.reason)
+
+        airport_y = "WTCY"
+        self._seed_airport_series(
+            airport_y,
+            flight_dates=[date(2024, 6, 1)],
+            observation_dates=[date(2024, 6, 1)],
+            source_model="best_match_utc_v1",
+            hourly=True,
+        )
+        with dw_engine.begin() as conn:
+            airport_key = conn.execute(
+                text("SELECT airport_key FROM dim_airport WHERE airport_code=:c"),
+                {"c": airport_y},
+            ).scalar()
+            conn.execute(
+                text(
+                    "INSERT INTO dim_weather (airport_key, observation_time, temperature, source_dataset, source_model) "
+                    "VALUES (:k, NULL, 25.0, 'open-meteo-archive', 'best_match_utc_v1')"
+                ),
+                {"k": airport_key},
+            )
+        with dw_engine.connect() as conn:
+            gate_y = ro.verify_utc_weather_coverage(
+                conn, airport_y, date(2024, 6, 1), date(2024, 6, 1), "UTC"
+            )
+        self.assertFalse(gate_y.passed)
+        self.assertIn("invalid timestamps detected", gate_y.reason)
+
+    def test_watermark_remains_unchanged_when_any_gate_fails(self):
+        airport = "WTCH"
+        etl_audit.record_watermark("weather", airport, "2024-05-01 12:00:00")
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[date(2024, 6, 1)],
+            source_model="best_match_utc_v1",
+            hourly=True,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-fail-unchanged", _fresh_config()
+        )
+        self.assertIn(airport, held)
+        self.assertNotIn(airport, advanced)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2024-05-01 12:00:00",
+        )
+
+    def test_successful_verification_proposes_advancement_without_production_write(self):
+        from database import dw_engine
+
+        airport = self._seed_airport_series(
+            "WTC1",
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[
+                date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3)
+            ],
+            source_model="best_match_utc_v1",
+            hourly=True,
+        )
+        with dw_engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM etl_watermark WHERE source_name='weather' AND window_key=:a"),
+                {"a": airport},
+            )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-propose-dry", _fresh_config(), dry_run=True
+        )
+        self.assertIn(airport, advanced)
+        self.assertEqual(advanced[airport], "2024-06-03 23:00:00Z")
+        self.assertNotIn(airport, held)
+        marks = etl_audit.get_watermarks("weather")
+        self.assertNotIn(airport, marks)
+
+    def test_coverage_gate_result_reporting_format(self):
+        res = ro.CoverageGateResult(
+            airport_code="LHR",
+            passed=False,
+            coverage_basis="utc",
+            expected_range=(datetime(2024, 6, 1, 0, 0), datetime(2024, 6, 3, 23, 0)),
+            verified_range=(datetime(2024, 6, 1, 0, 0), datetime(2024, 6, 2, 23, 0)),
+            total_expected=72,
+            total_verified=48,
+            missing_count=24,
+            missing_intervals=[(datetime(2024, 6, 3, 0, 0), datetime(2024, 6, 3, 23, 0))],
+            duplicate_count=2,
+            reason="incomplete persisted coverage: 24 observation(s) missing",
+        )
+        summary = res.summary()
+        self.assertIn("LHR", res.format_report())
+        self.assertIn("incomplete persisted coverage", summary)
+        self.assertIn("expected:", summary)
+        self.assertIn("verified:", summary)
+        self.assertIn("missing_intervals:", summary)
+        self.assertIn("duplicates: 2", summary)
+        as_dict = res.as_dict()
+        self.assertEqual(as_dict["airport_code"], "LHR")
+        self.assertFalse(as_dict["passed"])
+        self.assertEqual(as_dict["duplicate_count"], 2)
+
     # ---------- stage-level per-airport windows ----------
 
     @staticmethod
@@ -535,7 +1010,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         import pandas as pd
 
         return pd.DataFrame({
-            "time": [pd.Timestamp(f"{start_date} 00:00:00")],
+            "time_utc": [pd.Timestamp(f"{start_date} 00:00:00", tz="UTC")],
             "temperature_2m": [25.0],
             "relative_humidity_2m": [60.0],
             "precipitation": [0.0],
@@ -577,7 +1052,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
             return self._archive_frame(start_date)
 
         def fake_visibility(icao, tz, start_date, end_date):
-            return pd.DataFrame(columns=["time", "visibility_km"])
+            return pd.DataFrame(columns=["time_utc", "visibility_km"])
 
         out = io.StringIO()
         with mock.patch.object(
@@ -697,7 +1172,11 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
 
     # ---------- fixtures ----------
 
-    def _seed_airport_series(self, code, flight_dates, observation_dates):
+    def _seed_airport_series(self, code, flight_dates, observation_dates,
+                             source_model="best_match",
+                             observation_hour=12,
+                             hourly=False,
+                             observation_times=None):
         """Seed one airport with multiple flight days and observation days."""
         from database import dw_engine
 
@@ -741,15 +1220,30 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
                     "rk": route_key,
                     "sd": f"{flight_date} 10:00:00",
                 })
-            for observation_date in observation_dates:
+            times_to_insert = []
+            if observation_times is not None:
+                times_to_insert = [
+                    t.strftime("%Y-%m-%d %H:%M:%S") if isinstance(t, datetime) else str(t)
+                    for t in observation_times
+                ]
+            elif hourly:
+                for observation_date in observation_dates:
+                    for hour in range(24):
+                        times_to_insert.append(f"{observation_date} {hour:02d}:00:00")
+            else:
+                for observation_date in observation_dates:
+                    times_to_insert.append(f"{observation_date} {observation_hour:02d}:00:00")
+
+            for obs in times_to_insert:
                 conn.execute(text(
                     "INSERT IGNORE INTO dim_weather (airport_key,"
                     " observation_time, temperature, source_dataset,"
                     " source_model) VALUES"
-                    " (:k, :obs, 25.0, 'open-meteo-archive', 'best_match')"
+                    " (:k, :obs, 25.0, 'open-meteo-archive', :model)"
                 ), {
                     "k": airport_key,
-                    "obs": f"{observation_date} 12:00:00",
+                    "obs": obs,
+                    "model": source_model,
                 })
         return code
 

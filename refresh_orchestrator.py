@@ -63,7 +63,7 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import etl_audit
 import verify_warehouse
@@ -327,11 +327,12 @@ def _overlap_days(config):
 def _parse_watermark_datetime(value, airport_code=None):
     """Parse a stored watermark into the airport's local wall-clock time.
 
-    Watermarks written by this project are naive local observation times,
-    matching ``dim_weather.observation_time``. An aware value is converted
-    to the airport timezone when it is known. Unparseable/empty values are
-    treated as missing: the caller then fetches that airport's full history
-    instead of guessing an unsafe window."""
+    Legacy watermarks are naive local observation times, matching legacy
+    ``dim_weather.observation_time`` rows. UTC-model watermarks are stored
+    with a trailing ``Z`` and are converted to the airport's local wall
+    clock here for window derivation. Unparseable/empty values are treated
+    as missing: the caller then fetches that airport's full history instead
+    of guessing an unsafe window."""
     if value is None:
         return None
     raw = str(value).strip()
@@ -359,6 +360,42 @@ def _parse_watermark_datetime(value, airport_code=None):
                 pass
         parsed = parsed.replace(tzinfo=None)
     return parsed
+
+
+def _parse_watermark_utc(value, airport_code=None):
+    """Parse a stored watermark into a naive UTC datetime.
+
+    A value with an explicit UTC designator (written after a UTC-model
+    advancement) is authoritative UTC. A legacy naive value is converted
+    from the airport's local wall clock so old and new watermarks can be
+    compared on the same basis. Returns None when the value is missing,
+    unparseable, or the legacy conversion would be a DST guess."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(
+            tzinfo=None, microsecond=0
+        )
+    try:
+        import weather_etl
+        from timestamp_semantics import local_to_utc
+
+        info = weather_etl.AIRPORT_INFO.get(airport_code) or {}
+        tz_name = info.get("tz")
+        if not tz_name:
+            return None
+        return local_to_utc(
+            parsed.replace(microsecond=0), tz_name
+        ).astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
 
 
 def _parse_watermark_date(value, airport_code=None):
@@ -408,26 +445,508 @@ def weather_start_overrides(config):
     return overrides or None
 
 
-def advance_weather_watermarks(batch_guid, config=None):
+class CoverageGateResult:
+    """Structured outcome from the full-span UTC coverage verification gate."""
+
+    def __init__(
+        self,
+        airport_code,
+        passed,
+        coverage_basis="utc",
+        expected_range=None,
+        verified_range=None,
+        total_expected=0,
+        total_verified=0,
+        missing_count=0,
+        missing_intervals=None,
+        duplicate_count=0,
+        wrong_model_count=0,
+        invalid_timestamp_count=0,
+        reason=None,
+        candidate_watermark=None,
+    ):
+        self.airport_code = airport_code
+        self.passed = bool(passed)
+        self.coverage_basis = coverage_basis
+        self.expected_range = expected_range
+        self.verified_range = verified_range
+        self.total_expected = total_expected
+        self.total_verified = total_verified
+        self.missing_count = missing_count
+        self.missing_intervals = missing_intervals or []
+        self.duplicate_count = duplicate_count
+        self.wrong_model_count = wrong_model_count
+        self.invalid_timestamp_count = invalid_timestamp_count
+        self.reason = reason
+        self.candidate_watermark = candidate_watermark
+
+    def as_dict(self):
+        return {
+            "airport_code": self.airport_code,
+            "passed": self.passed,
+            "coverage_basis": self.coverage_basis,
+            "expected_range": (
+                (self.expected_range[0].isoformat(), self.expected_range[1].isoformat())
+                if self.expected_range else None
+            ),
+            "verified_range": (
+                (self.verified_range[0].isoformat(), self.verified_range[1].isoformat())
+                if self.verified_range else None
+            ),
+            "total_expected": self.total_expected,
+            "total_verified": self.total_verified,
+            "missing_count": self.missing_count,
+            "missing_intervals": [
+                (start.isoformat(), end.isoformat())
+                for start, end in self.missing_intervals
+            ],
+            "duplicate_count": self.duplicate_count,
+            "wrong_model_count": self.wrong_model_count,
+            "invalid_timestamp_count": self.invalid_timestamp_count,
+            "reason": self.reason,
+            "candidate_watermark": (
+                self.candidate_watermark.isoformat()
+                if self.candidate_watermark else None
+            ),
+        }
+
+    def summary(self):
+        exp_str = (
+            f"{self.expected_range[0]}..{self.expected_range[1]}"
+            if self.expected_range else "none"
+        )
+        ver_str = (
+            f"{self.verified_range[0]}..{self.verified_range[1]}"
+            if self.verified_range else "none"
+        )
+        if self.missing_intervals:
+            intervals_str = ", ".join(
+                f"{start}..{end}" for start, end in self.missing_intervals[:3]
+            )
+            if len(self.missing_intervals) > 3:
+                intervals_str += f" (+{len(self.missing_intervals) - 3} more)"
+        else:
+            intervals_str = "none"
+
+        return (
+            f"{self.reason} "
+            f"(expected: {exp_str}, verified: {ver_str}, "
+            f"missing_intervals: [{intervals_str}], duplicates: {self.duplicate_count})"
+        )
+    def format_report(self):
+        exp_str = (
+            f"{self.expected_range[0]}..{self.expected_range[1]}"
+            if self.expected_range else "none"
+        )
+        ver_str = (
+            f"{self.verified_range[0]}..{self.verified_range[1]}"
+            if self.verified_range else "none"
+        )
+        if self.missing_intervals:
+            intervals_str = ", ".join(
+                f"{start}..{end}" for start, end in self.missing_intervals[:3]
+            )
+            if len(self.missing_intervals) > 3:
+                intervals_str += f" (+{len(self.missing_intervals) - 3} more)"
+        else:
+            intervals_str = "none"
+
+        return (
+            f"airport={self.airport_code}, expected={exp_str}, "
+            f"verified={ver_str}, missing_count={self.missing_count}, "
+            f"missing_intervals=[{intervals_str}], duplicates={self.duplicate_count}, "
+            f"wrong_model={self.wrong_model_count}, invalid_ts={self.invalid_timestamp_count}, "
+            f"status={'PASS' if self.passed else 'HELD'}"
+            + (f", reason={self.reason}" if self.reason else "")
+        )
+
+
+def generate_expected_utc_instants(start_date, end_date, tz_name):
+    """Derive expected UTC hourly instants for local calendar dates.
+
+    Open-Meteo's archive API with `timeformat=unixtime` and `timezone=tz_name`
+    returns one observation for every hour of each local calendar day from
+    start_date through end_date (inclusive).
+
+    This helper accounts for:
+    - Airport timezone wall-clock bounds
+    - Timezone offsets, including half-hour offsets (e.g. Asia/Colombo, minute=30)
+    - DST spring-forward transitions (23-hour local days)
+    - DST fall-back transitions (25-hour local days)
+    - Consecutive UTC hourly instants spaced by exactly 3600 seconds.
+
+    Returns a list of timezone-naive UTC datetime objects, matching
+    ``dim_weather.observation_time``.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(str(tz_name))
+    except Exception as error:
+        raise ValueError(f"invalid IANA timezone {tz_name!r}") from error
+
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+    if isinstance(end_date, datetime):
+        end_date = end_date.date()
+
+    if start_date > end_date:
+        return []
+
+    # Start of local start_date: 00:00:00 wall clock
+    start_local = datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0)
+    start_utc = start_local.replace(tzinfo=tz, fold=0).astimezone(timezone.utc)
+    while start_utc.astimezone(tz).date() < start_date:
+        start_utc += timedelta(hours=1)
+    while (start_utc - timedelta(hours=1)).astimezone(tz).date() >= start_date:
+        start_utc -= timedelta(hours=1)
+
+    # End of local end_date: 23:00:00 wall clock
+    end_local = datetime(end_date.year, end_date.month, end_date.day, 23, 0, 0)
+    end_utc = end_local.replace(tzinfo=tz, fold=1).astimezone(timezone.utc)
+    while end_utc.astimezone(tz).date() > end_date:
+        end_utc -= timedelta(hours=1)
+    while (end_utc + timedelta(hours=1)).astimezone(tz).date() <= end_date:
+        end_utc += timedelta(hours=1)
+
+    instants = []
+    curr = start_utc
+    while curr <= end_utc:
+        loc_dt = curr.astimezone(tz)
+        if start_date <= loc_dt.date() <= end_date:
+            instants.append(curr.astimezone(timezone.utc).replace(tzinfo=None))
+        curr += timedelta(hours=1)
+    return instants
+
+
+def verify_utc_weather_coverage(
+    conn,
+    airport_code,
+    flight_start,
+    flight_end,
+    tz_name,
+    stored_watermark=None,
+    config=None,
+):
+    """Verify full-span UTC archive coverage for one airport before watermark advancement.
+
+    The gate independently checks:
+    1. The expected archive range is derived from the historical archive/flight start
+       through requested end date. Legacy local watermarks NEVER shorten this range.
+    2. Only rows with ``source_model = 'best_match_utc_v1'`` satisfy coverage.
+    3. Exact expected UTC hourly instants are matched rather than naive local dates.
+    4. Timezone shifts, DST spring-forward/fall-back, and half-hour offsets are handled.
+    5. Missing observations, duplicate instants, invalid timestamps, and wrong-model
+       rows are detected and block advancement.
+    6. Incomplete archive ranges and missing provider data block advancement; missing
+       data is never silently assumed complete.
+    7. Legacy local watermarks cannot satisfy UTC-model coverage, and candidate watermarks
+       cannot move backwards.
+
+    Returns a ``CoverageGateResult``.
+    """
+    from weather_etl import (
+        ARCHIVE_MAX_DATE,
+        ARCHIVE_MIN_DATE,
+        ARCHIVE_UTC_SOURCE_MODEL,
+    )
+
+    if config is None:
+        config = load_config()
+
+    if isinstance(flight_start, datetime):
+        flight_start = flight_start.date()
+    if isinstance(flight_end, datetime):
+        flight_end = flight_end.date()
+
+    expected_start_date = max(flight_start, ARCHIVE_MIN_DATE)
+    configured_start = config.get("weather_start_date")
+    if configured_start:
+        try:
+            if isinstance(configured_start, str):
+                configured_start = datetime.fromisoformat(configured_start).date()
+            expected_start_date = max(expected_start_date, configured_start)
+        except Exception:
+            pass
+
+    expected_end_date = min(flight_end, ARCHIVE_MAX_DATE)
+
+    if expected_start_date > expected_end_date:
+        return CoverageGateResult(
+            airport_code=airport_code,
+            passed=False,
+            coverage_basis="utc",
+            reason=f"no archive coverage required ({expected_start_date}..{expected_end_date})",
+        )
+
+    try:
+        expected_instants = generate_expected_utc_instants(
+            expected_start_date, expected_end_date, tz_name
+        )
+    except Exception as error:
+        return CoverageGateResult(
+            airport_code=airport_code,
+            passed=False,
+            coverage_basis="utc",
+            reason=f"failed to compute expected UTC instants: {error}",
+        )
+
+    if not expected_instants:
+        return CoverageGateResult(
+            airport_code=airport_code,
+            passed=False,
+            coverage_basis="utc",
+            reason=f"no archive coverage required ({expected_start_date}..{expected_end_date})",
+        )
+
+    expected_range = (expected_instants[0], expected_instants[-1])
+    total_expected = len(expected_instants)
+
+    from sqlalchemy import text
+    rows = conn.execute(
+        text(
+            """
+            SELECT w.observation_time,
+                   w.source_model,
+                   COUNT(*) AS cnt
+            FROM dim_weather w
+            JOIN dim_airport a ON w.airport_key = a.airport_key
+            WHERE a.airport_code = :airport
+              AND w.source_dataset = 'open-meteo-archive'
+            GROUP BY w.observation_time, w.source_model
+            """
+        ),
+        {"airport": airport_code},
+    ).fetchall()
+
+    utc_instants_map = {}
+    wrong_model_count = 0
+    invalid_timestamp_count = 0
+
+    for obs_time, source_model, cnt in rows:
+        if obs_time is None:
+            invalid_timestamp_count += cnt
+            continue
+        if source_model == ARCHIVE_UTC_SOURCE_MODEL:
+            utc_instants_map[obs_time] = cnt
+        else:
+            wrong_model_count += cnt
+
+    duplicate_count = sum(cnt - 1 for cnt in utc_instants_map.values() if cnt > 1)
+    verified_set = set(utc_instants_map.keys())
+    total_verified = len(verified_set)
+    verified_range = (min(verified_set), max(verified_set)) if verified_set else None
+
+    missing = [t for t in expected_instants if t not in verified_set]
+    missing_count = len(missing)
+
+    missing_intervals = []
+    if missing:
+        interval_start = missing[0]
+        prev = missing[0]
+        for t in missing[1:]:
+            if t - prev == timedelta(hours=1):
+                prev = t
+            else:
+                missing_intervals.append((interval_start, prev))
+                interval_start = t
+                prev = t
+        missing_intervals.append((interval_start, prev))
+
+    persisted_in_window = [t for t in expected_instants if t in verified_set]
+    if not persisted_in_window:
+        reason = (
+            f"no persisted observations for {expected_start_date}..{expected_end_date} "
+            f"in the UTC model (legacy rows ignored)"
+        )
+        return CoverageGateResult(
+            airport_code=airport_code,
+            passed=False,
+            coverage_basis="utc",
+            expected_range=expected_range,
+            verified_range=verified_range,
+            total_expected=total_expected,
+            total_verified=total_verified,
+            missing_count=missing_count,
+            missing_intervals=missing_intervals,
+            duplicate_count=duplicate_count,
+            wrong_model_count=wrong_model_count,
+            invalid_timestamp_count=invalid_timestamp_count,
+            reason=reason,
+        )
+
+    if invalid_timestamp_count > 0:
+        reason = (
+            f"invalid timestamps detected: {invalid_timestamp_count} "
+            f"row(s) with NULL observation_time"
+        )
+        return CoverageGateResult(
+            airport_code=airport_code,
+            passed=False,
+            coverage_basis="utc",
+            expected_range=expected_range,
+            verified_range=verified_range,
+            total_expected=total_expected,
+            total_verified=total_verified,
+            missing_count=missing_count,
+            missing_intervals=missing_intervals,
+            duplicate_count=duplicate_count,
+            wrong_model_count=wrong_model_count,
+            invalid_timestamp_count=invalid_timestamp_count,
+            reason=reason,
+        )
+
+    if duplicate_count > 0:
+        reason = f"duplicate UTC instants detected ({duplicate_count} duplicate rows)"
+        return CoverageGateResult(
+            airport_code=airport_code,
+            passed=False,
+            coverage_basis="utc",
+            expected_range=expected_range,
+            verified_range=verified_range,
+            total_expected=total_expected,
+            total_verified=total_verified,
+            missing_count=missing_count,
+            missing_intervals=missing_intervals,
+            duplicate_count=duplicate_count,
+            wrong_model_count=wrong_model_count,
+            invalid_timestamp_count=invalid_timestamp_count,
+            reason=reason,
+        )
+
+    if missing:
+        first_missing = missing[0]
+        reason = (
+            f"incomplete persisted coverage: {missing_count} observation(s) "
+            f"missing from {expected_start_date}..{expected_end_date} "
+            f"(first missing {first_missing})"
+        )
+        return CoverageGateResult(
+            airport_code=airport_code,
+            passed=False,
+            coverage_basis="utc",
+            expected_range=expected_range,
+            verified_range=verified_range,
+            total_expected=total_expected,
+            total_verified=total_verified,
+            missing_count=missing_count,
+            missing_intervals=missing_intervals,
+            duplicate_count=duplicate_count,
+            wrong_model_count=wrong_model_count,
+            invalid_timestamp_count=invalid_timestamp_count,
+            reason=reason,
+        )
+
+    if verified_range[0] > expected_range[0] or verified_range[1] < expected_range[1]:
+        reason = (
+            f"incomplete archive range: verified {verified_range[0]}..{verified_range[1]}, "
+            f"expected {expected_range[0]}..{expected_range[1]}"
+        )
+        return CoverageGateResult(
+            airport_code=airport_code,
+            passed=False,
+            coverage_basis="utc",
+            expected_range=expected_range,
+            verified_range=verified_range,
+            total_expected=total_expected,
+            total_verified=total_verified,
+            missing_count=missing_count,
+            missing_intervals=missing_intervals,
+            duplicate_count=duplicate_count,
+            wrong_model_count=wrong_model_count,
+            invalid_timestamp_count=invalid_timestamp_count,
+            reason=reason,
+        )
+
+    # Candidate watermark evaluation
+    candidate = verified_range[1].replace(microsecond=0)
+    if stored_watermark is not None:
+        watermark_utc = _parse_watermark_utc(stored_watermark, airport_code)
+        watermark_mark = _parse_watermark_datetime(stored_watermark, airport_code)
+        if watermark_mark is not None and watermark_utc is None:
+            reason = "cannot reconcile the legacy local watermark to UTC safely"
+            return CoverageGateResult(
+                airport_code=airport_code,
+                passed=False,
+                coverage_basis="utc",
+                expected_range=expected_range,
+                verified_range=verified_range,
+                total_expected=total_expected,
+                total_verified=total_verified,
+                missing_count=missing_count,
+                missing_intervals=missing_intervals,
+                duplicate_count=duplicate_count,
+                wrong_model_count=wrong_model_count,
+                invalid_timestamp_count=invalid_timestamp_count,
+                reason=reason,
+            )
+        if watermark_utc is not None and candidate < watermark_utc:
+            reason = (
+                f"validated UTC data would move the watermark backwards "
+                f"({candidate} < {watermark_utc})"
+            )
+            return CoverageGateResult(
+                airport_code=airport_code,
+                passed=False,
+                coverage_basis="utc",
+                expected_range=expected_range,
+                verified_range=verified_range,
+                total_expected=total_expected,
+                total_verified=total_verified,
+                missing_count=missing_count,
+                missing_intervals=missing_intervals,
+                duplicate_count=duplicate_count,
+                wrong_model_count=wrong_model_count,
+                invalid_timestamp_count=invalid_timestamp_count,
+                reason=reason,
+            )
+
+    return CoverageGateResult(
+        airport_code=airport_code,
+        passed=True,
+        coverage_basis="utc",
+        expected_range=expected_range,
+        verified_range=verified_range,
+        total_expected=total_expected,
+        total_verified=total_verified,
+        missing_count=0,
+        missing_intervals=[],
+        duplicate_count=0,
+        wrong_model_count=wrong_model_count,
+        invalid_timestamp_count=0,
+        reason=None,
+        candidate_watermark=candidate,
+    )
+
+
+def advance_weather_watermarks(batch_guid, config=None, dry_run=False):
     """Advance per-airport watermarks AFTER the weather stage committed.
 
     An airport's watermark moves only when its independently queried
-    persisted observations cover EVERY calendar day of the expected window
-    (its own first flight / watermark minus overlap through its last flight,
-    capped at the archive's latest available day). The persisted maximum is
-    taken from within that window, never from a stale future row.
+    persisted observations cover the required archive window.
 
-    Airports whose fetch failed, whose data is incomplete, whose window has
-    no archive coverage, or whose configuration is unsupported keep their
-    old watermark (or none), so the next run re-covers them. Watermark
-    writes use the separate audit session; a write failure raises
-    AuditError (reported as exit code 5 - committed data is still valid).
+    Coverage is evaluated on a per-model basis:
+    - Once an airport has any UTC-model rows (``best_match_utc_v1``) or an
+      existing UTC watermark, the model-aware full-span UTC coverage verification
+      gate runs. Only ``best_match_utc_v1`` rows can satisfy the check; legacy rows
+      cannot mask gaps or satisfy coverage. The expected start is derived from the
+      full archive-supported flight history, never from a legacy watermark.
+      New UTC watermarks are stored with a trailing ``Z``.
+    - For airports with strictly legacy data and legacy watermarks, the legacy
+      daily check is preserved unchanged.
+
+    If ``dry_run`` is True, proposed watermarks are returned in ``advanced``
+    without performing any write to ``etl_watermark``.
 
     Returns ``(advanced, held)`` for reporting."""
     from sqlalchemy import text
 
     from database import dw_engine
-    from weather_etl import AIRPORT_INFO, ARCHIVE_MAX_DATE, ARCHIVE_MIN_DATE
+    from weather_etl import (
+        AIRPORT_INFO,
+        ARCHIVE_MAX_DATE,
+        ARCHIVE_MIN_DATE,
+        ARCHIVE_UTC_SOURCE_MODEL,
+    )
 
     if config is None:
         config = load_config()
@@ -459,84 +978,138 @@ def advance_weather_watermarks(batch_guid, config=None):
                 held[airport] = "no coordinates/timezone/ICAO configured"
                 continue
 
-            watermark_mark = _parse_watermark_datetime(
-                watermarks.get(airport), airport
+            stored_mark = watermarks.get(airport)
+            has_utc_watermark = (
+                stored_mark is not None
+                and str(stored_mark).strip().endswith("Z")
             )
-            if watermark_mark is not None:
-                watermark_mark = watermark_mark.replace(microsecond=0)
-            watermark_date = (
-                watermark_mark.date() if watermark_mark is not None else None
-            )
-            expected_start, expected_end = _expected_weather_window(
-                span_start, span_end, watermark_date, overlap,
-                ARCHIVE_MIN_DATE, ARCHIVE_MAX_DATE,
-            )
-            if expected_start > expected_end:
-                held[airport] = (
-                    f"no archive coverage required "
-                    f"({expected_start}..{expected_end})"
-                )
-                continue
-
-            coverage_rows = conn.execute(
+            has_utc_rows = conn.execute(
                 text(
                     """
-                    SELECT DATE(w.observation_time) AS obs_date,
-                           MAX(w.observation_time) AS max_obs
+                    SELECT 1
                     FROM dim_weather w
                     JOIN dim_airport a ON w.airport_key = a.airport_key
                     WHERE a.airport_code = :airport
                       AND w.source_dataset = 'open-meteo-archive'
+                      AND w.source_model = :utc_model
                       AND w.observation_time IS NOT NULL
-                      AND DATE(w.observation_time) >= :expected_start
-                      AND DATE(w.observation_time) <= :expected_end
-                    GROUP BY DATE(w.observation_time)
+                    LIMIT 1
                     """
                 ),
                 {
                     "airport": airport,
-                    "expected_start": expected_start,
-                    "expected_end": expected_end,
+                    "utc_model": ARCHIVE_UTC_SOURCE_MODEL,
                 },
-            ).fetchall()
+            ).first() is not None
 
-            if not coverage_rows:
-                held[airport] = (
-                    f"no persisted observations for "
-                    f"{expected_start}..{expected_end}"
-                )
-                continue
+            coverage_basis = "utc" if (has_utc_watermark or has_utc_rows) else "legacy"
 
-            present_dates = {row[0] for row in coverage_rows}
-            max_obs = max(row[1] for row in coverage_rows)
-            missing = [
-                expected_start + timedelta(days=offset)
-                for offset in range(
-                    (expected_end - expected_start).days + 1
+            if coverage_basis == "utc":
+                info = AIRPORT_INFO[airport]
+                tz_name = info.get("tz")
+                gate = verify_utc_weather_coverage(
+                    conn,
+                    airport,
+                    span_start,
+                    span_end,
+                    tz_name,
+                    stored_watermark=stored_mark,
+                    config=config,
                 )
-                if expected_start + timedelta(days=offset)
-                not in present_dates
-            ]
-            if missing:
-                held[airport] = (
-                    f"incomplete persisted coverage: {len(missing)} day(s) "
-                    f"missing from {expected_start}..{expected_end} "
-                    f"(first missing {missing[0]})"
-                )
-                continue
+                if not gate.passed:
+                    held[airport] = gate.summary()
+                    continue
 
-            candidate = max_obs.replace(microsecond=0)
-            if watermark_mark is not None and candidate < watermark_mark:
-                held[airport] = (
-                    f"validated data would move the watermark backwards "
-                    f"({candidate} < {watermark_mark})"
+                stored_value = gate.candidate_watermark.strftime(
+                    "%Y-%m-%d %H:%M:%SZ"
                 )
-                continue
+                if not dry_run:
+                    etl_audit.record_watermark(
+                        "weather", airport, stored_value, batch_guid,
+                    )
+                advanced[airport] = stored_value
+            else:
+                watermark_mark = _parse_watermark_datetime(
+                    stored_mark, airport
+                )
+                if watermark_mark is not None:
+                    watermark_mark = watermark_mark.replace(microsecond=0)
+                watermark_date = (
+                    watermark_mark.date() if watermark_mark is not None else None
+                )
+                expected_start, expected_end = _expected_weather_window(
+                    span_start, span_end, watermark_date, overlap,
+                    ARCHIVE_MIN_DATE, ARCHIVE_MAX_DATE,
+                )
+                if expected_start > expected_end:
+                    held[airport] = (
+                        f"no archive coverage required "
+                        f"({expected_start}..{expected_end})"
+                    )
+                    continue
 
-            etl_audit.record_watermark(
-                "weather", airport, candidate, batch_guid,
-            )
-            advanced[airport] = str(max_obs)
+                raw_coverage_rows = conn.execute(
+                    text(
+                        """
+                        SELECT w.source_model,
+                               DATE(w.observation_time) AS obs_date,
+                               MAX(w.observation_time) AS max_obs
+                        FROM dim_weather w
+                        JOIN dim_airport a ON w.airport_key = a.airport_key
+                        WHERE a.airport_code = :airport
+                          AND w.source_dataset = 'open-meteo-archive'
+                          AND w.observation_time IS NOT NULL
+                          AND DATE(w.observation_time) >= :expected_start
+                          AND DATE(w.observation_time) <= :expected_end
+                        GROUP BY w.source_model, DATE(w.observation_time)
+                        """
+                    ),
+                    {
+                        "airport": airport,
+                        "expected_start": expected_start,
+                        "expected_end": expected_end,
+                    },
+                ).fetchall()
+
+                if not raw_coverage_rows:
+                    held[airport] = (
+                        f"no persisted observations for "
+                        f"{expected_start}..{expected_end}"
+                    )
+                    continue
+
+                present_dates = {row[1] for row in raw_coverage_rows}
+                max_obs = max(row[2] for row in raw_coverage_rows)
+                missing = [
+                    expected_start + timedelta(days=offset)
+                    for offset in range(
+                        (expected_end - expected_start).days + 1
+                    )
+                    if expected_start + timedelta(days=offset)
+                    not in present_dates
+                ]
+                if missing:
+                    held[airport] = (
+                        f"incomplete persisted coverage: {len(missing)} day(s) "
+                        f"missing from {expected_start}..{expected_end} "
+                        f"(first missing {missing[0]})"
+                    )
+                    continue
+
+                candidate = max_obs.replace(microsecond=0)
+                if watermark_mark is not None and candidate < watermark_mark:
+                    held[airport] = (
+                        f"validated data would move the watermark backwards "
+                        f"({candidate} < {watermark_mark})"
+                    )
+                    continue
+
+                stored_value = candidate
+                if not dry_run:
+                    etl_audit.record_watermark(
+                        "weather", airport, stored_value, batch_guid,
+                    )
+                advanced[airport] = stored_value
 
     return advanced, held
 

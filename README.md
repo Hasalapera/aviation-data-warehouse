@@ -10,7 +10,7 @@ and six dimensions/facts served to Power BI through 25 analytical queries
 | Path | Purpose |
 |---|---|
 | `sql/schema.sql` | Warehouse schema (6 tables, protected) |
-| `etl.py`, `weather_etl.py`, `oltp_etl.py`, `main_etl.py` | Existing ETL stages (protected; `weather_etl.py` has approved additive, default-preserving incremental-window kwargs) |
+| `etl.py`, `weather_etl.py`, `oltp_etl.py`, `main_etl.py` | Existing ETL stages (protected; `weather_etl.py` has approved incremental-window kwargs and the UTC/DST storage correction) |
 | `members/*.py` | 25 immutable analytical queries (5 files x 5) |
 | `refresh_orchestrator.py` | Refresh entry point: lock -> audit -> stages -> verify (see docs) |
 | `verify_warehouse.py` | Read-only post-load verification |

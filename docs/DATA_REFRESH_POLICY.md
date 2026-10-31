@@ -16,9 +16,10 @@ approach was chosen, and the guarantees every refresh must uphold.
 3. Existing ETL code (`etl.py`, `weather_etl.py`, `oltp_etl.py`,
    `main_etl.py`) keeps its behaviour. Refresh orchestration wraps those
    entry points; it never reimplements extract/transform/load logic.
-   `weather_etl.py` received only additive, default-preserving keywords:
-   `start_date_override=None` and the per-airport
-   `start_date_overrides=None` mapping (P2).
+   `weather_etl.py` received additive, default-preserving incremental-window
+   keywords (`start_date_override=None`, `start_date_overrides=None`) and the
+   separately reviewed UTC/DST storage correction (UTC archive rows under
+   `source_model=best_match_utc_v1`, UTC IEM requests, exact-only matching).
 4. Every stage attempt leaves an audit row, even when the stage
    transaction rolls back (audit writes use a separate autocommit
    session).
@@ -71,7 +72,9 @@ silently using a different window or accidentally activating the mode.
 
 - Watermarks are per origin airport, stored in `etl_watermark`
   (`window_key = airport_code`, `watermark_value = MAX(observation_time)`
-  within the validated window).
+  within the validated window). Legacy values are naive airport-local
+  labels; after an airport has UTC-model observations, values are stored as
+  UTC instants with a trailing `Z` so the basis is never guessed.
 - Fetch start is computed **per airport** from that airport's own
   watermark: `watermark_date - overlap_days`, then raised to the airport's
   first flight and the archive's earliest available day. One airport's
@@ -95,10 +98,17 @@ silently using a different window or accidentally activating the mode.
   `[max(first flight, watermark - overlap) .. min(last flight, archive max)]`
   must have a persisted `open-meteo-archive` observation. The new
   watermark is the maximum observation timestamp **inside that window**
-  (never a stale row beyond the expected end). A candidate older than the
-  stored value is rejected, so a shrinking flight window can never rewind
-  a watermark. Airports failing any part of this check keep their old
-  watermark, so the next run re-covers them (self-healing).
+  (never a stale row beyond the expected end).
+- Coverage is model-aware. Once an airport has any
+  `best_match_utc_v1` row, only UTC-model rows can satisfy its coverage;
+  legacy `best_match`/reanalysis labels cannot mask a UTC gap. Before that
+  first UTC row, the legacy models remain the coverage basis unchanged.
+- A candidate older than the stored watermark is rejected, so a shrinking
+  flight window can never rewind a watermark. When UTC-model coverage is
+  present, a legacy local watermark is converted to UTC for this comparison
+  (a DST-ambiguous legacy value is held rather than guessed). Airports
+  failing any part of this check keep their old watermark, so the next run
+  re-covers them (self-healing).
 - Incremental mode changes only *which window* is fetched; the upsert,
   chunking, retries and dry-run behaviour of `weather_etl.py` are
   untouched. With incremental disabled, no override is passed and the
@@ -116,8 +126,12 @@ suite, including mocked end-to-end upsert/rollback tests, and read-only
 Open-Meteo/IEM validation succeeded for all eight configured airports
 (CMB, DXB, SIN, LHR, KUL, DEL, DOH, BOM; 2024-06-01..03). A first
 production run with no existing watermarks still fetches full history and
-then establishes per-airport watermarks. To roll back, set
-`weather_incremental.enabled=false` (see `docs/ETL_OPERATIONS.md`).
+then establishes per-airport watermarks. Existing legacy watermarks are
+local labels, so an incremental first UTC run only covers their overlap
+window; set `weather_incremental.enabled=false` for a full UTC backfill.
+After that succeeds, later runs can re-enable incremental mode. To roll
+back, set `weather_incremental.enabled=false` (see
+`docs/ETL_OPERATIONS.md`).
 
 ### OLTP bounded change updater (opt-in, default OFF)
 

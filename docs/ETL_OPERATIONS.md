@@ -81,7 +81,10 @@ Incremental weather is controlled **only** by
   data.
 - A watermark only advances when that airport's persisted observations
   cover every calendar day of its expected window and verification passed.
-  Inspect progress and withheld airports with:
+  Once an airport has `best_match_utc_v1` rows, only UTC-model rows count
+  toward coverage; legacy local labels cannot hide a UTC gap. New UTC
+  watermarks are written with a trailing `Z` (for example
+  `2026-10-22 18:00:00Z`). Inspect progress and withheld airports with:
 
 ```sql
 SELECT window_key, watermark_value, updated_at, last_batch_guid
@@ -290,6 +293,39 @@ venv/bin/python refresh_orchestrator.py --dry-run
 - Pre-existing state at Phase 0: `tests/` contained only stale `.pyc`
   files (sources never committed) - the old suite was unrunnable; see
   `docs/BASELINE_MANIFEST.md`.
+
+## Weather timestamp semantics (UTC/DST correction)
+
+- New weather archive rows use `source_model = "best_match_utc_v1"` and store
+  the true UTC instant in `dim_weather.observation_time`. The airport's IANA
+  `source_timezone` is retained for local display.
+- Open-Meteo is requested with `timeformat=unixtime`; its `timezone` response
+  offset is not used for historical conversion because it is resolved once at
+  request time and ignores DST transitions in the requested range.
+- IEM visibility is requested with `tz=UTC` and merged by local hour plus UTC
+  offset, so repeated fall-back hours remain distinct.
+- Legacy `best_match` rows are left untouched and are never linker
+  candidates. They retain their old fixed-offset labels.
+- CSV and OLTP flight timestamp semantics are explicitly `unresolved` until a
+  source contract is documented and verified. The linker therefore makes no
+  proposals and updates no `weather_key` values by default.
+- DST gaps and repeated local hours are held; no nearest-hour matching is
+  used.
+- Before the first UTC ingest, reconcile the weather watermark. Existing
+  values are legacy fixed-offset local labels, so they are ahead of the
+  equivalent UTC instant by that airport's UTC offset (up to 8 hours across
+  the configured airports; CMB/DEL/BOM +5:30, DXB +4, DOH +3, SIN/KUL +8,
+  LHR +0/+1). Watermark code converts a legacy local value to UTC for the
+  no-rewind comparison once UTC rows exist, and stores the new value with a
+  `Z` suffix. It still must not be rewritten blindly.
+- An incremental first UTC run starts at the old local watermark minus the
+  overlap, so it creates only a partial UTC history. For a full UTC backfill,
+  set `weather_incremental.enabled=false` for that first run; re-enable it
+  only after the UTC stage and verification succeed.
+- Current schema limitation: there is no separate UTC/offset column. The
+  versioned `source_model` separates legacy and UTC rows, but analytics that
+  group by `observation_time` without `source_timezone` will see UTC wall
+  times. Protected analytics files have not been modified.
 
 ## Safety rules for operators
 

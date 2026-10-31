@@ -24,6 +24,7 @@ import io
 import os
 import sys
 import unittest
+from datetime import date, datetime
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -222,10 +223,10 @@ class TestWeatherPersistence(unittest.TestCase):
         import pandas as pd
 
         return pd.DataFrame({
-            "time": pd.to_datetime([
+            "time_utc": pd.to_datetime([
                 "2024-03-01 00:00:00",
                 "2024-03-01 01:00:00",
-            ]),
+            ], utc=True),
             "temperature_2m": [temperature, temperature],
             "relative_humidity_2m": [60.0, 61.0],
             "precipitation": [0.0, 0.0],
@@ -272,7 +273,9 @@ class TestWeatherPersistence(unittest.TestCase):
             calls.append((code, start_date, end_date))
             return self._archive_frame(temperature)
 
-        empty_visibility = pd.DataFrame(columns=["time", "visibility_km"])
+        empty_visibility = pd.DataFrame(
+            columns=["time_utc", "visibility_km"]
+        )
         with mock.patch.object(
             weather_etl, "_read_flights", return_value=flights
         ), mock.patch.object(
@@ -359,6 +362,280 @@ class TestWeatherAndMasterEntrypoints(unittest.TestCase):
 
         _, output = _quiet(run_weather_etl, dry_run=True, airport_filter=["CMBB"])
         self.assertIsInstance(output, str)
+
+
+class TestWeatherLinkerDryRun(unittest.TestCase):
+    """Unit-level tests for the safe weather linker; no database is touched."""
+
+    @classmethod
+    def setUpClass(cls):
+        import weather_linker
+
+        cls.linker = weather_linker
+
+    def _fact(self, **overrides):
+        row = {
+            "flight_key": 1,
+            "source_system": "csv",
+            "source_flight_id": "1",
+            "scheduled_departure": datetime(2025, 11, 24, 12, 0),
+            "old_weather_key": None,
+            "airport_code": "CMB",
+            "candidate_weather_key": None,
+            "candidate_observation_time": None,
+            "candidate_visibility": None,
+            "candidate_source_dataset": None,
+            "candidate_source_model": None,
+        }
+        row.update(overrides)
+        return row
+
+    def _candidate(self, fact, **overrides):
+        row = dict(fact)
+        row.update(
+            {
+                "candidate_weather_key": 101,
+                "candidate_observation_time": datetime(2025, 11, 24, 6, 30),
+                "candidate_visibility": 8.5,
+                "candidate_source_dataset": self.linker.ARCHIVE_SOURCE_DATASET,
+                "candidate_source_model":
+                    self.linker.ARCHIVE_UTC_SOURCE_MODEL,
+            }
+        )
+        row.update(overrides)
+        return row
+
+    def _plan(self, fact, candidates=(), semantics=None):
+        return self.linker.build_link_plan(
+            [fact, *candidates],
+            source_semantics=semantics or {"csv": "origin_local"},
+        )
+
+    def test_minutes_from_midnight_conversion(self):
+        combine = self.linker.combine_flight_date_and_minutes
+        self.assertEqual(
+            combine(date(2025, 11, 24), 720),
+            datetime(2025, 11, 24, 12, 0),
+        )
+        self.assertEqual(
+            combine("2025-11-24", 0),
+            datetime(2025, 11, 24, 0, 0),
+        )
+        self.assertEqual(
+            combine("2025-11-24", 1439),
+            datetime(2025, 11, 24, 23, 59),
+        )
+        for value in (None, -1, 1440, 12.5, True, "not-a-number"):
+            with self.subTest(minutes=value):
+                with self.assertRaises(ValueError):
+                    combine("2025-11-24", value)
+        for value in (None, "not-a-date", datetime(2025, 11, 24, 1, 0)):
+            with self.subTest(flight_date=value):
+                with self.assertRaises(ValueError):
+                    combine(value, 720)
+
+    def test_exact_origin_local_hour_match(self):
+        fact = self._fact(
+            scheduled_departure=datetime(2025, 11, 24, 12, 45),
+            old_weather_key=9,
+        )
+        candidate = self._candidate(
+            fact, candidate_observation_time=datetime(2025, 11, 24, 6, 30)
+        )
+        row = self._plan(fact, [candidate])[0]
+        self.assertEqual(row["status"], self.linker.MATCH)
+        self.assertEqual(row["timezone"], "Asia/Colombo")
+        self.assertEqual(row["target_hour"], datetime(2025, 11, 24, 12, 0))
+        self.assertEqual(
+            row["target_utc_hour"], datetime(2025, 11, 24, 6, 30)
+        )
+        self.assertEqual(row["old_weather_key"], 9)
+        self.assertEqual(row["new_weather_key"], 101)
+
+    def test_wrong_hour_is_not_matched(self):
+        fact = self._fact(scheduled_departure=datetime(2025, 11, 24, 12, 45))
+        candidate = self._candidate(
+            fact, candidate_observation_time=datetime(2025, 11, 24, 7, 30)
+        )
+        row = self._plan(fact, [candidate])[0]
+        self.assertEqual(row["status"], self.linker.NO_EXACT_CANDIDATE)
+        self.assertIsNone(row["new_weather_key"])
+
+    def test_airport_timezone_lookup_and_unsupported_airport(self):
+        tz_name, status = self.linker.airport_timezone("CMB")
+        self.assertIsNone(status)
+        self.assertEqual(tz_name, "Asia/Colombo")
+        self.assertEqual(self.linker.airport_timezone("GALL")[0], None)
+        self.assertEqual(
+            self.linker.airport_timezone("GALL")[1],
+            self.linker.UNSUPPORTED_AIRPORT,
+        )
+        row = self._plan(self._fact(airport_code="GALL"))[0]
+        self.assertEqual(row["status"], self.linker.UNSUPPORTED_AIRPORT)
+
+    def test_invalid_iana_timezone_is_unsupported(self):
+        fact = self._fact()
+        with mock.patch.dict(
+            self.linker.AIRPORT_INFO,
+            {"CMB": {"tz": "Mars/Olympus"}},
+            clear=False,
+        ):
+            row = self._plan(fact)[0]
+        self.assertEqual(row["status"], self.linker.UNSUPPORTED_TIMEZONE)
+
+    def test_missing_and_invalid_departure(self):
+        for value in (None, "not-a-date"):
+            with self.subTest(value=value):
+                row = self._plan(
+                    self._fact(scheduled_departure=value, old_weather_key=4)
+                )[0]
+                self.assertEqual(row["status"], self.linker.INVALID_DEPARTURE)
+                self.assertEqual(row["old_weather_key"], 4)
+                self.assertIsNone(row["new_weather_key"])
+
+    def test_no_exact_candidate_keeps_existing_link(self):
+        row = self._plan(self._fact(old_weather_key=4))[0]
+        self.assertEqual(row["status"], self.linker.NO_EXACT_CANDIDATE)
+        self.assertEqual(row["old_weather_key"], 4)
+        self.assertIsNone(row["new_weather_key"])
+        pending = self.linker.pending_link_changes([row])
+        self.assertEqual(pending, [])
+
+    def test_duplicate_exact_candidates_are_ambiguous(self):
+        fact = self._fact()
+        candidates = [
+            self._candidate(fact, candidate_weather_key=101),
+            self._candidate(fact, candidate_weather_key=202),
+        ]
+        row = self._plan(fact, candidates)[0]
+        self.assertEqual(row["status"], self.linker.AMBIGUOUS_CANDIDATE)
+        self.assertEqual(row["candidate_count"], 2)
+        self.assertIsNone(row["new_weather_key"])
+
+    def test_wrong_source_dataset_or_model_is_ignored(self):
+        fact = self._fact()
+        wrong_dataset = self._candidate(
+            fact, candidate_source_dataset="legacy"
+        )
+        wrong_model = self._candidate(fact, candidate_source_model="other")
+        row = self._plan(fact, [wrong_dataset, wrong_model])[0]
+        self.assertEqual(row["status"], self.linker.NO_EXACT_CANDIDATE)
+
+    def test_null_visibility_is_excluded(self):
+        fact = self._fact()
+        candidate = self._candidate(fact, candidate_visibility=None)
+        row = self._plan(fact, [candidate])[0]
+        self.assertEqual(row["status"], self.linker.NULL_VISIBILITY)
+        self.assertIsNone(row["new_weather_key"])
+
+    def test_dry_run_preserves_existing_keys_and_never_writes(self):
+        fact = self._fact(old_weather_key=4)
+        candidate = self._candidate(fact, candidate_weather_key=101)
+        plan = self._plan(fact, [candidate])
+        before = [dict(row) for row in plan]
+
+        result = self.linker.apply_links(
+            plan, engine=object(), dry_run=True
+        )
+
+        self.assertEqual(result["rows_updated"], 0)
+        self.assertEqual(result["rows_pending"], 1)
+        self.assertEqual(plan, before)
+        self.assertEqual(plan[0]["old_weather_key"], 4)
+        self.assertEqual(plan[0]["new_weather_key"], 101)
+
+    def test_empty_execute_plan_does_not_open_a_transaction(self):
+        result = self.linker.apply_links([], engine=object(), dry_run=False)
+        self.assertEqual(result["rows_updated"], 0)
+
+    class _FakeResult:
+        def __init__(self, rows=()):
+            self._rows = rows
+
+        def mappings(self):
+            return list(self._rows)
+
+    class _FakeConnection:
+        def __init__(self, rows=(), read_error=None, reset_error=None):
+            self._rows = rows
+            self._read_error = read_error
+            self._reset_error = reset_error
+            self.statements = []
+            self.invalidated = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            self.statements.append(sql)
+            if sql == "SET SESSION TRANSACTION READ ONLY":
+                return TestWeatherLinkerDryRun._FakeResult()
+            if sql == "SET SESSION TRANSACTION READ WRITE":
+                if self._reset_error is not None:
+                    raise self._reset_error
+                return TestWeatherLinkerDryRun._FakeResult()
+            if self._read_error is not None:
+                raise self._read_error
+            return TestWeatherLinkerDryRun._FakeResult(self._rows)
+
+        def invalidate(self):
+            self.invalidated = True
+
+    class _FakeEngine:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def connect(self):
+            return self._connection
+
+    def test_read_candidate_rows_restores_read_write_on_success(self):
+        rows = [{"flight_key": 1, "source_system": "csv"}]
+        conn = self._FakeConnection(rows=rows)
+
+        result = self.linker.read_candidate_rows(self._FakeEngine(conn))
+
+        self.assertEqual(result, rows)
+        self.assertEqual(
+            conn.statements[0], "SET SESSION TRANSACTION READ ONLY"
+        )
+        self.assertEqual(
+            conn.statements[-1], "SET SESSION TRANSACTION READ WRITE"
+        )
+        self.assertEqual(len(conn.statements), 3)
+        self.assertFalse(conn.invalidated)
+
+    def test_read_candidate_rows_restores_read_write_when_read_fails(self):
+        read_error = RuntimeError("candidate read failed")
+        conn = self._FakeConnection(read_error=read_error)
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.linker.read_candidate_rows(self._FakeEngine(conn))
+
+        self.assertIs(caught.exception, read_error)
+        self.assertEqual(
+            conn.statements[-1], "SET SESSION TRANSACTION READ WRITE"
+        )
+        self.assertFalse(conn.invalidated)
+
+    def test_read_candidate_rows_preserves_read_error_when_reset_fails(self):
+        read_error = RuntimeError("candidate read failed")
+        reset_error = RuntimeError("reset failed")
+        conn = self._FakeConnection(
+            read_error=read_error, reset_error=reset_error
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.linker.read_candidate_rows(self._FakeEngine(conn))
+
+        self.assertIs(caught.exception, read_error)
+        self.assertEqual(
+            conn.statements[-1], "SET SESSION TRANSACTION READ WRITE"
+        )
+        self.assertTrue(conn.invalidated)
 
 
 if __name__ == "__main__":
