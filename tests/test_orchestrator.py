@@ -30,17 +30,18 @@ def _fresh_config():
     return copy.deepcopy(ro.load_config())
 
 
-def _stub_stages(fail=(), weather_output=None):
+def _stub_stages(fail=(), weather_failed=None):
     """Deterministic stage stubs shared by test classes (offline)."""
     calls = []
 
     def make(name):
         def stage(**kwargs):
             calls.append((name, kwargs))
-            if name == "weather" and weather_output:
-                print(weather_output)
             if name in fail:
                 raise RuntimeError(f"{name} exploded")
+            if name == "weather":
+                return {"airports_failed": list(weather_failed or [])}
+            return None
         return stage
 
     return {n: make(n) for n in ("csv", "weather", "oltp")}, calls
@@ -64,16 +65,17 @@ class TestOrchestrator(unittest.TestCase):
 
     # ---------- helpers ----------
 
-    def _stages(self, fail=(), weather_output=None):
+    def _stages(self, fail=(), weather_failed=None):
         calls = []
 
         def make(name):
             def stage(**kwargs):
                 calls.append((name, kwargs))
-                if name == "weather" and weather_output:
-                    print(weather_output)
                 if name in fail:
                     raise RuntimeError(f"{name} exploded")
+                if name == "weather":
+                    return {"airports_failed": list(weather_failed or [])}
+                return None
             return stage
 
         return {n: make(n) for n in ("csv", "weather", "oltp")}, calls
@@ -276,10 +278,8 @@ class TestOrchestrator(unittest.TestCase):
 
     # ---------- weather PARTIAL status ----------
 
-    def test_weather_partial_status_is_reported_from_stage_output(self):
-        stages, _ = self._stages(
-            weather_output="airports failed : ['ZZZZ']"
-        )
+    def test_weather_partial_status_is_reported_from_structured_result(self):
+        stages, _ = self._stages(weather_failed=["ZZZZ"])
         code = ro.run_refresh(
             _fresh_config(),
             stages=stages,
@@ -289,8 +289,8 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn(("weather", "PARTIAL"), statuses)
         self.assertEqual(code, ro.EXIT_STAGE_FAILED)  # weather is required
 
-    def test_weather_clean_output_is_success(self):
-        stages, _ = self._stages(weather_output="airports failed : []")
+    def test_weather_clean_result_is_success(self):
+        stages, _ = self._stages(weather_failed=[])
         code = ro.run_refresh(
             _fresh_config(),
             stages=stages,

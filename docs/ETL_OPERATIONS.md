@@ -6,6 +6,9 @@ All commands run from the repository root with the project venv:
 source venv/bin/activate   # or use venv/bin/python directly
 ```
 
+The scheduled wrapper requires `venv/bin/python` and validates the
+runtime imports; it never falls back to system Python.
+
 Configuration lives in `.env` (never committed) and
 `config/refresh_policy.json` (safe to edit; defaults preserve the
 original ETL behaviour).
@@ -39,18 +42,23 @@ What one run does, in order:
    another run holds it, exit `3` without touching anything.
 4. Per stage: record `RUNNING` (fail-closed: no audit row -> stage not
    executed) -> run the existing ETL entry point with stdout captured to
-   `logs/refresh_<ts>_<batch>_<source>.log` -> measure honest counts ->
-   record terminal status + metrics (audit failure -> exit `5`, remaining
-   stages skipped). Ctrl-C during a stage closes the audit row as FAILED
-   and exits `130` (committed data is not rolled back).
+   `logs/refresh_<ts>_<batch>_<source>.log` -> capture the stage's
+   structured result -> measure honest counts -> record terminal status +
+   metrics (audit failure -> exit `5`, remaining stages skipped). The
+   weather stage is `PARTIAL` when its returned `airports_failed` list is
+   non-empty; console text is never parsed. Ctrl-C during a stage closes
+   the audit row as FAILED and exits `130` (committed data is not rolled
+   back).
 5. Post-load verification (read-only, `verify_warehouse.py`), itself
    audited as source `verify`.
 6. Watermarks advance per airport (weather, only if incremental enabled,
    the stage ended `SUCCESS`, verification ran, verification passed, and
-   that airport's persisted observations cover every day of its own
-   expected window). `--no-verify` suppresses advancement; `PARTIAL` /
-   `FAILED` stages advance nothing. Held airports are printed with the
-   reason and re-covered next run.
+   that airport's persisted observations cover every expected UTC instant
+   of its own window). The candidate is the maximum **verified in-window**
+   instant; stale or future rows outside the expected window can never
+   advance it. `--no-verify` suppresses advancement; `PARTIAL` / `FAILED`
+   stages advance nothing. Held airports are printed with the reason and
+   re-covered next run.
 7. Print summary and exit with the policy exit code.
 
 Exit codes: `0` ok, `1` required stage failed, `2` preflight, `3` locked,
@@ -80,9 +88,11 @@ Incremental weather is controlled **only** by
   corrections are picked up; it is not a completeness margin for older
   data.
 - A watermark only advances when that airport's persisted observations
-  cover every calendar day of its expected window and verification passed.
-  Once an airport has `best_match_utc_v1` rows, only UTC-model rows count
-  toward coverage; legacy local labels cannot hide a UTC gap. New UTC
+  cover every expected UTC instant of its window (not merely every calendar
+  date) and verification passed. Once an airport has `best_match_utc_v1`
+  rows, only UTC-model rows count toward coverage; legacy local labels
+  cannot hide a UTC gap. Stale/future rows outside the expected window are
+  visible for reporting but are excluded from the candidate. New UTC
   watermarks are written with a trailing `Z` (for example
   `2026-10-22 18:00:00Z`). Inspect progress and withheld airports with:
 
@@ -257,27 +267,93 @@ SELECT * FROM etl_watermark WHERE source_name = 'weather'
  ORDER BY updated_at DESC;
 ```
 
-## Logs
+## Logs and retention
 
 - Stage output: `logs/refresh_<timestamp>_<batch>_<source>.log`
 - Scheduled runs (if enabled): `logs/scheduled_refresh_<date>.log`
+- launchd-level output: `logs/launchd_refresh.log` and `.err`
 - `logs/` is git-ignored.
+
+Python owns retention; the wrapper does not run `find`/`-delete`.
+`prune_old_logs()` runs once at the end of a normal refresh, after the
+database lock is released:
+
+- `ETL_LOG_RETENTION_DAYS` controls the age limit; default `30`.
+- Invalid values fall back to `30`; `0` or negative disables pruning.
+- Only `refresh_*` and `scheduled_refresh_*` `.log`/`.err` files are
+  eligible.
+- The newest 10 eligible files are always protected, preserving recent
+  failure logs.
+- `launchd_*` stdout/stderr is never pruned automatically (launchd owns
+  those handles); rotate them manually if needed.
 
 ## Scheduled refresh (P3, disabled by default)
 
 `scripts/scheduled_refresh.sh` wraps the orchestrator (lock, log, exit
-code). launchd templates live in `scripts/launchd/` and are **not
-installed**; enabling a schedule is an explicit operator action documented
-in the template headers.
+code) and requires `$REPO/venv/bin/python` with `pymysql`, `sqlalchemy`,
+`pandas`, `dotenv`, and `requests`. A missing venv or module exits `2`
+and logs the reason; it never runs system Python.
+
+Only one LaunchAgent is supported: `com.aviation.dw.refresh` (daily full
+pipeline). The old weekly weather-only template has been retired. Nothing
+is installed or activated by this repository.
+
+The template lives at
+`scripts/launchd/com.aviation.dw.refresh.plist.template`. Its
+`StartCalendarInterval` uses the Mac's **current system timezone**;
+launchd has no per-job timezone. The template says 02:00, but that is
+Asia/Colombo time only when the host is set to Asia/Colombo. Check with
+`readlink /etc/localtime` and adjust `Hour`/`Minute` or the host timezone.
+
+Install (explicit operator action, not performed by this task):
+
+```bash
+mkdir -p logs ~/Library/LaunchAgents
+sed "s|__REPO_PATH__|$PWD|g" \
+  scripts/launchd/com.aviation.dw.refresh.plist.template \
+  > ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
+launchctl bootstrap gui/$(id -u) \
+  ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
+launchctl print gui/$(id -u)/com.aviation.dw.refresh
+# optional immediate run:
+launchctl kickstart -k gui/$(id -u)/com.aviation.dw.refresh
+```
+
+If the label is already loaded, `bootstrap` fails; run
+`launchctl print` and `launchctl bootout` before bootstrapping again. Do
+not install a second job.
+
+Remove:
+
+```bash
+launchctl bootout gui/$(id -u)/com.aviation.dw.refresh
+rm ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
+```
+
+Monitor:
+
+```bash
+launchctl print gui/$(id -u)/com.aviation.dw.refresh
+tail -n 50 logs/launchd_refresh.log logs/launchd_refresh.err
+ls -lt logs/scheduled_refresh_*.log | head
+venv/bin/python refresh_orchestrator.py --status
+```
+
+Troubleshooting: exit `3` means another refresh holds the lock; exit `2`
+usually means the venv/modules or configuration are invalid; non-zero
+per-run logs should be inspected with the audit queries above.
 
 ## Tests
 
 ```bash
-venv/bin/python -m unittest discover        # full suite (from repo root)
+ETL_LOG_RETENTION_DAYS=0 venv/bin/python -m unittest discover tests
 venv/bin/python -m unittest tests.test_watermark -v
 venv/bin/python -m unittest tests.test_query_integrity -v
 venv/bin/python refresh_orchestrator.py --dry-run
 ```
+
+Set `ETL_LOG_RETENTION_DAYS=0` while running tests so the repository's
+own `logs/` directory is not pruned.
 
 - Tests force `DW_NAME=aviation_dw_ci` (disposable warehouse recreated
   from `sql/schema.sql`); the live `aviation_dw` cannot be written by the
@@ -285,9 +361,10 @@ venv/bin/python refresh_orchestrator.py --dry-run
 - `tests/test_etl_regression.py` runs the real CSV/OLTP stages against
   the test warehouse (OLTP stage skipped when the source is unreachable).
 - `tests/test_watermark.py` covers per-airport windows, overlap, first-run
-  behaviour, `PARTIAL`/`FAILED`/verification gating, incomplete persisted
-  coverage, future-flight capping, and repeated-run idempotency using
-  deterministic stubs (no weather network access).
+  behaviour, structured `PARTIAL`/`FAILED`/verification gating, stale and
+  future out-of-window observations, missing final observations, DST,
+  leap day, half-hour offsets, retention, and launchd/script structure
+  using deterministic stubs (no weather network access).
 - A real weather fetch is opt-in:
   `AVIATION_TESTS_WEATHER_NET=1 venv/bin/python -m unittest discover`.
 - Pre-existing state at Phase 0: `tests/` contained only stale `.pyc`
@@ -300,8 +377,16 @@ venv/bin/python refresh_orchestrator.py --dry-run
   the true UTC instant in `dim_weather.observation_time`. The airport's IANA
   `source_timezone` is retained for local display.
 - Open-Meteo is requested with `timeformat=unixtime`; its `timezone` response
-  offset is not used for historical conversion because it is resolved once at
-  request time and ignores DST transitions in the requested range.
+  offset is resolved once at request time and does not reconstruct historical
+  DST across the requested range. With a London request made while the
+  request-time offset is GMT, even a summer date can come back with UTC-day
+  boundaries.
+- To make coverage independent of that request-time offset, the archive fetch
+  requests one padded day on each side (clamped to `ARCHIVE_MIN_DATE` and
+  `date.today()`), then filters rows by the existing `time_local` field back
+  to the logical `start_date..end_date`. Timestamps are never shifted and
+  padded rows are never persisted. The exact-UTC-instant coverage gate still
+  holds on any genuine missing observation.
 - IEM visibility is requested with `tz=UTC` and merged by local hour plus UTC
   offset, so repeated fall-back hours remain distinct.
 - Legacy `best_match` rows are left untouched and are never linker
@@ -327,6 +412,28 @@ venv/bin/python refresh_orchestrator.py --dry-run
   group by `observation_time` without `source_timezone` will see UTC wall
   times. Protected analytics files have not been modified.
 
+## Historical backfill prerequisites
+
+This remediation does **not** perform a historical weather backfill and does
+not authorize one. Before any backfill:
+
+1. Take and verify a database backup.
+2. Confirm Power BI / reporting does not directly consume `dim_weather` in a
+   way that assumes local wall-clock `observation_time`. Direct consumption
+   remains **unverified**; the 25 protected queries are unchanged.
+3. Establish and document authoritative CSV and OLTP flight timestamp
+   conventions. They remain `unresolved`, so weather linking and
+   `fact_flight.weather_key` updates remain deferred. Do not run
+   `weather_linker.py --execute`.
+4. Reconcile legacy local watermarks to UTC (or run with incremental mode
+   disabled for the first full UTC pass) and review the expected per-airport
+   date span.
+5. Run the full test suite, query checksum, and warehouse verification; review
+   the coverage report for every airport before advancing production
+   watermarks.
+6. Run the backfill as an explicit, separately approved operation - not as
+   part of this code patch.
+
 ## Safety rules for operators
 
 - Never run a refresh while `main_etl.py` is running (no shared lock).
@@ -347,8 +454,8 @@ venv/bin/python refresh_orchestrator.py --dry-run
 
 | Exit | First action |
 |---|---|
-| 1 | `SELECT ... FROM etl_batch_log ORDER BY run_id DESC LIMIT 5` - read `error_detail`/`notes`; failed stage is marked; rerun is safe (idempotent). |
-| 2 | Check `.env` connectivity, `--source` names, `config/refresh_policy.json`. |
+| 1 | `SELECT ... FROM etl_batch_log ORDER BY run_id DESC LIMIT 5` - read `error_detail`/`notes`; failed or `PARTIAL` stage is marked; rerun is safe (idempotent). |
+| 2 | Check the repository venv/imports, `.env` connectivity, `--source` names, `config/refresh_policy.json`. |
 | 3 | Find the holder: another orchestrator/terminal; wait or stop it. |
 | 4 | Audit layer down (disk/privileges/table missing): fix MySQL access; nothing was executed. |
 | 5 | Stage data may be committed while audit failed: inspect `etl_batch_log`, verify row counts, then rerun (idempotent). |

@@ -4,29 +4,43 @@
   launchd template: DAILY warehouse refresh (P3).
 
   *** NOT INSTALLED. This file is a template only; nothing loads it. ***
-  Enabling a schedule is an explicit operator action (see below), and the
-  refresh itself still serialises against manual runs via the MySQL lock
-  (a collision exits 3 and does nothing).
+  Enabling a schedule is an explicit operator action. This is the ONLY
+  supported LaunchAgent: do not also install the retired weather-only job.
 
   To enable (macOS):
-    1. Replace __REPO_PATH__ everywhere in this file with the absolute
-       path to this repository, e.g. via:
+    1. mkdir -p __REPO_PATH__/logs ~/Library/LaunchAgents
+    2. Replace __REPO_PATH__ everywhere in this file with the absolute
+       path to this repository, for example:
          sed "s|__REPO_PATH__|$PWD|g" \
            scripts/launchd/com.aviation.dw.refresh.plist.template \
            > ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
-    2. launchctl load ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
-    3. Verify: launchctl list | grep aviation.dw.refresh
+    3. launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
+    4. Verify: launchctl print gui/$(id -u)/com.aviation.dw.refresh
+    5. Optional immediate run:
+         launchctl kickstart -k gui/$(id -u)/com.aviation.dw.refresh
 
   To disable again:
-    launchctl unload ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
+    launchctl bootout gui/$(id -u)/com.aviation.dw.refresh
     rm ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
 
-  Notes:
-  - Runs every day at 03:00 (adjust StartCalendarInterval).
-  - Output and exit codes land in logs/ (per-run file created by the
-    wrapper; StandardOutPath catches launchd-level messages only).
-  - The wrapper + orchestrator never print credentials; logs are
-    git-ignored.
+  If the label is already loaded, bootstrap fails. Run `launchctl print`
+  first and `launchctl bootout` before bootstrapping again.
+
+  Timezone:
+  - StartCalendarInterval uses the Mac's CURRENT SYSTEM TIMEZONE. launchd
+    has no per-job timezone. This template says 02:00; that is Asia/Colombo
+    time only when the host timezone is Asia/Colombo. Check the host with:
+      readlink /etc/localtime
+    Adjust Hour/Minute or the host timezone if they differ.
+
+  Logs:
+  - The wrapper creates a per-run file under logs/ and also writes the
+    orchestrator exit code there.
+  - StandardOutPath/StandardErrorPath capture launchd-level messages only.
+  - The wrapper and orchestrator never print credentials; logs are
+    git-ignored. Per-run logs are pruned by Python; launchd_* files are
+    never pruned automatically.
 -->
 <plist version="1.0">
   <dict>
@@ -37,11 +51,13 @@
     <array>
       <string>__REPO_PATH__/scripts/scheduled_refresh.sh</string>
     </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO_PATH__</string>
 
     <key>StartCalendarInterval</key>
     <dict>
       <key>Hour</key>
-      <integer>3</integer>
+      <integer>2</integer>
       <key>Minute</key>
       <integer>0</integer>
     </dict>
@@ -58,7 +74,7 @@
     <key>EnvironmentVariables</key>
     <dict>
       <key>PATH</key>
-      <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+      <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
   </dict>
 </plist>

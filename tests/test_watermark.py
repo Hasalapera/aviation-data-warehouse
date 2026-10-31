@@ -109,8 +109,11 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         for code in (
             "WTOA", "WTWB", "WTCA", "WTCB", "WTCC", "WTCD", "WTCF",
             "WTC1", "WTC2", "WTC3", "WTC4", "WTC5", "WTCP", "WTCX",
-            "WTCY", "WTCH", "WTCDUP",
+            "WTCY", "WTCH", "WTCDUP", "WTFU", "WTST", "WTMF",
         )
+    }
+    FAKE_AIRPORTS["WTLH"] = {
+        "lat": 51.4700, "lon": -0.4543, "tz": "Europe/London", "icao": "EGLL"
     }
     FAKE_AIRPORTS["WTSF"] = {
         "lat": 51.4700, "lon": -0.4543, "tz": "Europe/London", "icao": "EGLL"
@@ -337,7 +340,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
 
     @staticmethod
     def _clean_weather_stage(**kwargs):
-        print("airports failed : []")
+        return {"airports_failed": []}
 
     def test_watermark_advances_only_when_stage_and_verification_succeed(self):
         airport_a, _ = self._seed_airports_and_flights()
@@ -380,7 +383,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         airport_a, airport_b = self._seed_airports_and_flights()
 
         def partial_stage(**kwargs):
-            print("airports failed : ['WTOA']")
+            return {"airports_failed": ["WTOA"]}
 
         code = ro.run_refresh(
             self._incremental_weather_config(),
@@ -587,6 +590,117 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         self.assertNotIn(airport, held)
         mark = etl_audit.get_watermarks("weather")[airport]
         self.assertEqual(mark, "2024-06-03 23:00:00Z")
+
+    def test_utc_future_observation_does_not_inflate_watermark(self):
+        airport = "WTFU"
+        expected = ro.generate_expected_utc_instants(
+            date(2024, 6, 1), date(2024, 6, 3), "UTC"
+        )
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=expected + [expected[-1] + timedelta(days=30)],
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-utc-future", _fresh_config()
+        )
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2024-06-03 23:00:00Z",
+            "a future out-of-window observation must not advance the watermark",
+        )
+
+    def test_utc_stale_observation_does_not_inflate_watermark(self):
+        airport = "WTST"
+        expected = ro.generate_expected_utc_instants(
+            date(2024, 6, 1), date(2024, 6, 3), "UTC"
+        )
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=expected + [expected[0] - timedelta(days=30)],
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-utc-stale", _fresh_config()
+        )
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2024-06-03 23:00:00Z",
+            "a stale out-of-window observation must not change candidate selection",
+        )
+
+    def test_utc_missing_final_observation_holds_watermark(self):
+        airport = "WTMF"
+        expected = ro.generate_expected_utc_instants(
+            date(2024, 6, 1), date(2024, 6, 3), "UTC"
+        )
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=expected[:-1],
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-utc-missing-final", _fresh_config()
+        )
+        self.assertIn(airport, held)
+        self.assertNotIn(airport, advanced)
+        self.assertIn("1 observation(s) missing", held[airport])
+        self.assertIn(str(expected[-1]), held[airport])
+        self.assertNotIn(airport, etl_audit.get_watermarks("weather"))
+
+    def test_lhr_summer_start_padded_coverage_advances_to_expected_end(self):
+        airport = "WTLH"
+        expected = ro.generate_expected_utc_instants(
+            date(2024, 6, 1), date(2024, 6, 3), "Europe/London"
+        )
+        self.assertEqual(len(expected), 72)
+        self.assertEqual(expected[-1], datetime(2024, 6, 3, 22, 0))
+        self._seed_airport_series(
+            airport,
+            flight_dates=[date(2024, 6, 1), date(2024, 6, 3)],
+            observation_dates=[],
+            source_model="best_match_utc_v1",
+            observation_times=expected,
+        )
+        advanced, held = ro.advance_weather_watermarks(
+            "batch-lhr-summer", _fresh_config()
+        )
+        self.assertIn(airport, advanced)
+        self.assertNotIn(airport, held)
+        self.assertEqual(
+            etl_audit.get_watermarks("weather")[airport],
+            "2024-06-03 22:00:00Z",
+        )
+
+    def test_leap_day_expected_instants(self):
+        self.assertEqual(
+            len(ro.generate_expected_utc_instants(
+                date(2024, 2, 28), date(2024, 3, 1), "UTC"
+            )),
+            72,
+        )
+        self.assertEqual(
+            len(ro.generate_expected_utc_instants(
+                date(2024, 2, 29), date(2024, 2, 29), "UTC"
+            )),
+            24,
+        )
+
+    def test_lhr_full_archive_span_expected_instants(self):
+        expected = ro.generate_expected_utc_instants(
+            date(2025, 1, 9), date(2025, 12, 21), "Europe/London"
+        )
+        self.assertEqual(len(expected), 8328)
 
     def test_legacy_local_watermark_is_compared_in_utc(self):
         import weather_etl
@@ -1003,6 +1117,175 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         self.assertFalse(as_dict["passed"])
         self.assertEqual(as_dict["duplicate_count"], 2)
 
+
+    def test_launchd_refresh_plist_template_is_valid_and_single_daily_job(self):
+        import plistlib
+
+        plist_path = os.path.join(
+            ROOT, "scripts", "launchd", "com.aviation.dw.refresh.plist.template"
+        )
+        retired_path = os.path.join(
+            ROOT, "scripts", "launchd", "com.aviation.dw.weather.plist.template"
+        )
+        self.assertTrue(os.path.exists(plist_path))
+        self.assertFalse(
+            os.path.exists(retired_path),
+            "the duplicate weather-only LaunchAgent must stay retired",
+        )
+        with open(plist_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+        lowered = content.lower()
+        self.assertIn("current system timezone", lowered)
+        self.assertIn("asia/colombo", lowered)
+        self.assertNotIn("guarantee", lowered)
+        self.assertIn("launchctl bootstrap", content)
+        self.assertIn("launchctl bootout", content)
+        self.assertIn("launchctl print", content)
+        self.assertIn("launchctl kickstart", content)
+        self.assertNotIn("launchctl load", content)
+
+        rendered = content.replace("__REPO_PATH__", ROOT)
+        data = plistlib.loads(rendered.encode("utf-8"))
+        self.assertEqual(data.get("Label"), "com.aviation.dw.refresh")
+        self.assertEqual(data.get("WorkingDirectory"), ROOT)
+        interval = data.get("StartCalendarInterval")
+        self.assertEqual(interval.get("Hour"), 2)
+        self.assertEqual(interval.get("Minute"), 0)
+        self.assertIn(
+            "scripts/scheduled_refresh.sh",
+            data.get("ProgramArguments", [""])[0],
+        )
+        path_value = data.get("EnvironmentVariables", {}).get("PATH", "")
+        self.assertIn("/opt/homebrew/bin", path_value)
+
+    def test_scheduled_refresh_script_syntax_and_structure(self):
+        import subprocess
+
+        script_path = os.path.join(ROOT, "scripts", "scheduled_refresh.sh")
+        self.assertTrue(os.path.exists(script_path))
+        proc = subprocess.run(
+            ["bash", "-n", script_path], capture_output=True, text=True
+        )
+        self.assertEqual(proc.returncode, 0, f"bash -n failed: {proc.stderr}")
+
+        with open(script_path, "r", encoding="utf-8") as handle:
+            script_text = handle.read()
+        self.assertIn('PYTHON="$REPO/venv/bin/python"', script_text)
+        self.assertNotIn("command -v python3", script_text)
+        self.assertIn(
+            "import pymysql, sqlalchemy, pandas, dotenv, requests",
+            script_text,
+        )
+        self.assertIn("ETL_LOG_RETENTION_DAYS", script_text)
+        self.assertNotIn("find ", script_text)
+        self.assertNotIn("-delete", script_text)
+        self.assertIn('exit "$CODE"', script_text)
+
+    def test_prune_old_logs(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fresh_log = os.path.join(tmpdir, "scheduled_refresh_20261031_000000.log")
+            with open(fresh_log, "w", encoding="utf-8") as h:
+                h.write("fresh log")
+
+            old_log = os.path.join(tmpdir, "scheduled_refresh_20260901_000000.log")
+            with open(old_log, "w", encoding="utf-8") as h:
+                h.write("old log")
+            old_time = time.time() - (45 * 86400)
+            os.utime(old_log, (old_time, old_time))
+
+            ro.prune_old_logs(tmpdir, retention_days=30, keep_latest=1)
+            self.assertTrue(os.path.exists(fresh_log), "fresh log must be retained")
+            self.assertFalse(os.path.exists(old_log), "log older than 30 days must be pruned")
+
+    def test_prune_old_logs_keeps_launchd_and_newest_ten(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_time = time.time() - (45 * 86400)
+            launchd_log = os.path.join(tmpdir, "launchd_refresh.log")
+            launchd_err = os.path.join(tmpdir, "launchd_refresh.err")
+            for path in (launchd_log, launchd_err):
+                with open(path, "w", encoding="utf-8") as h:
+                    h.write("launchd-owned")
+                os.utime(path, (old_time, old_time))
+
+            refresh_logs = []
+            for index in range(12):
+                path = os.path.join(
+                    tmpdir, f"refresh_20260101_{index:02d}.log"
+                )
+                with open(path, "w", encoding="utf-8") as h:
+                    h.write(f"run {index}")
+                os.utime(path, (old_time, old_time))
+                refresh_logs.append(path)
+
+            ro.prune_old_logs(tmpdir, retention_days=30, keep_latest=10)
+            remaining = sorted(
+                name for name in os.listdir(tmpdir)
+                if name.startswith("refresh_")
+            )
+            self.assertEqual(len(remaining), 10)
+            self.assertIn("refresh_20260101_11.log", remaining)
+            self.assertNotIn("refresh_20260101_00.log", remaining)
+            self.assertTrue(os.path.exists(launchd_log))
+            self.assertTrue(os.path.exists(launchd_err))
+
+    def test_prune_old_logs_invalid_env_falls_back_to_30_days(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fresh_log = os.path.join(tmpdir, "refresh_20261031_000000.log")
+            with open(fresh_log, "w", encoding="utf-8") as h:
+                h.write("fresh log")
+            old_log = os.path.join(tmpdir, "refresh_20260901_000000.log")
+            with open(old_log, "w", encoding="utf-8") as h:
+                h.write("old log")
+            old_time = time.time() - (45 * 86400)
+            os.utime(old_log, (old_time, old_time))
+
+            with mock.patch.dict(
+                os.environ, {"ETL_LOG_RETENTION_DAYS": "not-an-integer"}
+            ):
+                ro.prune_old_logs(tmpdir, keep_latest=1)
+            self.assertFalse(os.path.exists(old_log))
+            self.assertTrue(os.path.exists(fresh_log))
+
+    def test_prune_old_logs_zero_disables_and_explicit_value_wins(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fresh_log = os.path.join(tmpdir, "refresh_20261031_000000.log")
+            with open(fresh_log, "w", encoding="utf-8") as h:
+                h.write("fresh log")
+            old_log = os.path.join(tmpdir, "refresh_20260901_000000.log")
+            with open(old_log, "w", encoding="utf-8") as h:
+                h.write("old log")
+            old_time = time.time() - (45 * 86400)
+            os.utime(old_log, (old_time, old_time))
+
+            with mock.patch.dict(os.environ, {"ETL_LOG_RETENTION_DAYS": "0"}):
+                ro.prune_old_logs(tmpdir, keep_latest=1)
+            self.assertTrue(os.path.exists(old_log), "0 must disable pruning")
+
+            ro.prune_old_logs(tmpdir, retention_days=30, keep_latest=1)
+            self.assertFalse(
+                os.path.exists(old_log),
+                "an explicit retention_days value must win over the environment",
+            )
+
+    def test_show_refresh_status_runs_without_error(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = ro.show_refresh_status(limit=2)
+        self.assertEqual(code, 0)
+        output = out.getvalue()
+        self.assertIn("RECENT REFRESH RUNS & WATERMARKS", output)
     # ---------- stage-level per-airport windows ----------
 
     @staticmethod
@@ -1021,7 +1304,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
 
     def _run_weather_stage(self, overrides=None, shared_override=None,
                            failing=()):
-        calls, _ = self._run_weather_stage_capture(
+        calls, _, _ = self._run_weather_stage_capture(
             overrides=overrides, shared_override=shared_override,
             failing=failing,
         )
@@ -1055,6 +1338,7 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
             return pd.DataFrame(columns=["time_utc", "visibility_km"])
 
         out = io.StringIO()
+        result = None
         with mock.patch.object(
             weather_etl, "_read_flights", return_value=flights
         ), mock.patch.object(
@@ -1065,12 +1349,12 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         ), mock.patch.object(
             weather_etl, "fetch_iem_visibility", side_effect=fake_visibility
         ), contextlib.redirect_stdout(out):
-            weather_etl.run_weather_etl(
+            result = weather_etl.run_weather_etl(
                 dry_run=True,
                 start_date_override=shared_override,
                 start_date_overrides=overrides,
             )
-        return calls, out.getvalue()
+        return calls, out.getvalue(), result
 
     def test_weather_etl_applies_each_airports_own_override(self):
         calls = self._run_weather_stage(
@@ -1094,14 +1378,14 @@ class TestWeatherWatermarkLogic(unittest.TestCase):
         )
 
     def test_weather_etl_partial_fetch_reports_failed_airport(self):
-        calls, output = self._run_weather_stage_capture(failing={"CMB"})
+        calls, output, result = self._run_weather_stage_capture(failing={"CMB"})
         self.assertEqual(
             [code for code, _, _ in calls], ["CMB", "DXB", "LHR"],
             "a failed airport must not stop the other airports",
         )
+        self.assertEqual(result["airports_failed"], ["CMB"])
         self.assertIn("['CMB']", output,
-                      "the stage summary must name the failed airport so the "
-                      "orchestrator can mark the stage PARTIAL")
+                      "the stage summary must still name the failed airport")
 
     def test_weather_etl_shared_override_still_supported(self):
         calls = self._run_weather_stage(shared_override=date(2024, 3, 5))

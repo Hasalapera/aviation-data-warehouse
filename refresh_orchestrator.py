@@ -59,7 +59,6 @@ import csv as csv_module
 import io
 import json
 import os
-import re
 import sys
 import time
 import uuid
@@ -202,6 +201,66 @@ class TeeIO(io.TextIOBase):
             except Exception:
                 pass
 
+def _is_prunable_log(fname):
+    """Only per-run wrapper/stage logs may be pruned.
+
+    launchd-owned stdout/stderr files are never touched: launchd keeps the
+    file handle open and rotates/truncates it itself.
+    """
+    return fname.endswith((".log", ".err")) and (
+        fname.startswith("refresh_")
+        or fname.startswith("scheduled_refresh_")
+    )
+
+
+def _resolve_retention_days(retention_days):
+    """Resolve the retention policy; invalid values fail safe to 30 days."""
+    raw = os.environ.get("ETL_LOG_RETENTION_DAYS", "30") if retention_days is None else retention_days
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 30
+
+
+def prune_old_logs(log_dir=LOG_DIR, retention_days=None, keep_latest=10):
+    """Prune old per-run logs; preserve the newest ``keep_latest`` files.
+
+    ``retention_days`` defaults to ``ETL_LOG_RETENTION_DAYS`` (30 days);
+    values <= 0 disable pruning. Only ``refresh_*`` and
+    ``scheduled_refresh_*`` files are eligible, so launchd stdout/stderr is
+    never deleted and an active wrapper log is protected by recency.
+    """
+    if not os.path.isdir(log_dir):
+        return
+    days = _resolve_retention_days(retention_days)
+    if days <= 0:
+        return
+    cutoff = time.time() - (days * 86400)
+
+    candidates = []
+    for fname in os.listdir(log_dir):
+        if not _is_prunable_log(fname):
+            continue
+        fpath = os.path.join(log_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            candidates.append((os.path.getmtime(fpath), fname, fpath))
+        except OSError:
+            continue
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    protected = {
+        fname for _, fname, _ in candidates[:max(int(keep_latest or 0), 0)]
+    }
+    for mtime, fname, fpath in candidates:
+        if fname in protected or mtime >= cutoff:
+            continue
+        try:
+            os.unlink(fpath)
+        except OSError:
+            pass
+
 
 def _save_stage_log(source, captured, batch_guid):
     try:
@@ -289,19 +348,20 @@ def _measure(source, before, after, rows_read):
 
 
 # =========================================================
-# WEATHER PARTIAL-STATUS PARSING (from the stage's own report)
+# WEATHER PARTIAL-STATUS FROM THE STAGE RESULT
 # =========================================================
 
-def _weather_partial_note(captured):
-    """Detect airports whose archive fetch failed inside a successful stage.
+def _weather_stage_note(stage_result):
+    """Return a PARTIAL note from the weather stage's structured result.
 
-    weather_etl.run_weather_etl returns success even when individual
-    airports failed to fetch; its summary line is the only reliable signal
-    without modifying the stage. If the format ever changes, this returns
-    None and the stage is reported as SUCCESS (documented limitation)."""
-    match = re.search(r"airports failed\s*:\s*\[([^\]]*)\]", captured or "")
-    if match and match.group(1).strip():
-        return f"archive fetch failed for: [{match.group(1).strip()}]"
+    The stage result is authoritative; console text is never parsed.
+    """
+    if not isinstance(stage_result, dict):
+        return None
+    failed = stage_result.get("airports_failed") or []
+    if failed:
+        rendered = ", ".join(str(airport) for airport in failed)
+        return f"archive fetch failed for: [{rendered}]"
     return None
 
 
@@ -857,8 +917,10 @@ def verify_utc_weather_coverage(
             reason=reason,
         )
 
-    # Candidate watermark evaluation
-    candidate = verified_range[1].replace(microsecond=0)
+    # Candidate watermark evaluation: only expected, verified in-window
+    # instants may advance the marker. Stale or future rows are reported
+    # above but must never inflate the watermark.
+    candidate = max(persisted_in_window).replace(microsecond=0)
     if stored_watermark is not None:
         watermark_utc = _parse_watermark_utc(stored_watermark, airport_code)
         watermark_mark = _parse_watermark_datetime(stored_watermark, airport_code)
@@ -1134,11 +1196,10 @@ def _default_stages(config):
 
     def weather_stage(start_date_override=None, start_date_overrides=None):
         if start_date_overrides is not None:
-            run_weather_etl(start_date_overrides=start_date_overrides)
-        elif start_date_override is not None:
-            run_weather_etl(start_date_override=start_date_override)
-        else:
-            run_weather_etl()
+            return run_weather_etl(start_date_overrides=start_date_overrides)
+        if start_date_override is not None:
+            return run_weather_etl(start_date_override=start_date_override)
+        return run_weather_etl()
 
     return {
         "csv": lambda: run_csv_etl(),
@@ -1284,7 +1345,10 @@ def run_refresh(
         _print_summary({}, batch_guid, started, aborted=True)
         return EXIT_INTERRUPTED
     finally:
-        lock.release()
+        try:
+            lock.release()
+        finally:
+            prune_old_logs()
 
 
 def _execute(config, selected, batch_guid, stages, verifier, verify,
@@ -1353,11 +1417,12 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
         real_stdout = sys.stdout
         sys.stdout = TeeIO(real_stdout, captured)
         stage_error = None
+        stage_result = None
         try:
             kwargs = {}
             if start_overrides is not None:
                 kwargs["start_date_overrides"] = start_overrides
-            stages[source](**kwargs)
+            stage_result = stages[source](**kwargs)
         except KeyboardInterrupt:
             interrupted = True
             stage_error = KeyboardInterrupt(
@@ -1387,7 +1452,7 @@ def _execute(config, selected, batch_guid, stages, verifier, verify,
         else:
             status = "SUCCESS"
             if source == "weather":
-                partial = _weather_partial_note(captured.getvalue())
+                partial = _weather_stage_note(stage_result)
                 if partial:
                     status = "PARTIAL"
                     notes.append(partial)
@@ -1719,6 +1784,42 @@ def _dry_run(config, selected):
     print(f"\n[DRY RUN] {'PREFLIGHT OK' if ok else 'PREFLIGHT FAILED'}")
     return EXIT_OK if ok else EXIT_PREFLIGHT
 
+def show_refresh_status(limit=5):
+    """Query etl_batch_log and report recent batch runs, stage outcomes, and watermarks."""
+    print("\n" + "=" * 78)
+    print(" RECENT REFRESH RUNS & WATERMARKS (read-only)")
+    print("=" * 78)
+    try:
+        runs = etl_audit.recent_runs(limit=limit)
+        if not runs:
+            print(" -> no audit rows found in etl_batch_log")
+        else:
+            print(f" -> Latest {len(runs)} stage executions:")
+            for r in runs:
+                bg = str(r.get("batch_guid") or "")[:8] or "none"
+                src = r.get("source_name") or "unknown"
+                st = r.get("status") or "unknown"
+                start = str(r.get("started_at") or "")[:19] or "?"
+                err = f" | error: {r.get('error_detail')}" if r.get("error_detail") else ""
+                print(
+                    f"   [{start}] batch={bg} stage={src:8} status={st:8} "
+                    f"read={r.get('rows_read')} inserted={r.get('rows_inserted')} "
+                    f"updated={r.get('rows_updated')} skipped={r.get('rows_skipped')}{err}"
+                )
+
+        watermarks = etl_audit.get_watermarks("weather")
+        print("\n -> Current weather watermarks:")
+        if not watermarks:
+            print("   (none recorded)")
+        else:
+            for k, v in sorted(watermarks.items()):
+                print(f"   {k:6}: {v}")
+    except Exception as error:
+        print(f" -> error querying status: {error}")
+        return 1
+    print("=" * 78)
+    return 0
+
 
 # =========================================================
 # CLI
@@ -1743,7 +1844,11 @@ def main(argv=None):
                              "updates to mutable attributes of EXISTING OLTP "
                              "fact rows (requires the 'oltp' stage to run; "
                              "run `python setup_database.py backup` first)")
+    parser.add_argument("--status", action="store_true",
+                        help="display recent refresh runs and watermark status from etl_batch_log without executing stages")
     args = parser.parse_args(argv)
+    if args.status:
+        return show_refresh_status()
 
     try:
         config = load_config(args.config)

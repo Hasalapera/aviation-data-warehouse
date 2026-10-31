@@ -224,6 +224,35 @@ def _request_text(url, params):
 # OPEN-METEO HISTORICAL ARCHIVE
 # ==========================================
 
+def _coerce_date(value):
+    """Normalise a date/datetime/ISO string to ``datetime.date``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
+def _padded_request_dates(start_date, end_date):
+    """Return an API request window padded by one day on each side.
+
+    Open-Meteo resolves the ``timezone`` offset once at request time. With
+    ``timeformat=unixtime`` a London request made while the request-time
+    offset is GMT returns UTC-day boundaries even for a summer date. Padding
+    guarantees the logical local days are present regardless of that offset;
+    ``fetch_archive_weather`` then filters to the logical dates.
+    """
+    logical_start = _coerce_date(start_date)
+    logical_end = _coerce_date(end_date)
+    request_start = max(
+        logical_start - timedelta(days=1), ARCHIVE_MIN_DATE
+    )
+    request_end = min(
+        logical_end + timedelta(days=1), date.today()
+    )
+    return request_start, request_end
+
+
 def fetch_archive_weather(airport_code, info, start_date, end_date):
     """Fetch hourly reanalysis weather as true UTC instants.
 
@@ -232,13 +261,23 @@ def fetch_archive_weather(airport_code, info, start_date, end_date):
     therefore unsafe for historical storage. ``timeformat=unixtime`` returns
     absolute UTC instants; the airport's IANA zone is used only for display
     and local-hour association.
+
+    The request is padded by one day on each side and the returned frame is
+    filtered back to the logical local dates. This avoids request-time-offset
+    boundary loss without shifting or fabricating timestamps.
     """
+
+    logical_start = _coerce_date(start_date)
+    logical_end = _coerce_date(end_date)
+    request_start, request_end = _padded_request_dates(
+        logical_start, logical_end
+    )
 
     params = {
         "latitude": info["lat"],
         "longitude": info["lon"],
-        "start_date": start_date,
-        "end_date": end_date,
+        "start_date": request_start.strftime("%Y-%m-%d"),
+        "end_date": request_end.strftime("%Y-%m-%d"),
         "hourly": ",".join(HOURLY_VARIABLES),
         "timezone": info["tz"],
         "timeformat": "unixtime",
@@ -268,8 +307,6 @@ def fetch_archive_weather(airport_code, info, start_date, end_date):
         )
 
     frame = pd.DataFrame({"time_utc": times_utc})
-
-    times_utc_python = times_utc.dt.tz_localize(None)
     frame["time_local"] = times_utc.dt.tz_convert(
         utc_zone(info["tz"])
     ).dt.tz_localize(None)
@@ -290,14 +327,19 @@ def fetch_archive_weather(airport_code, info, start_date, end_date):
             )
 
     frame = frame.reset_index(drop=True)
+    frame = frame[
+        (frame["time_local"].dt.date >= logical_start)
+        & (frame["time_local"].dt.date <= logical_end)
+    ].reset_index(drop=True)
 
     frame.attrs["time_basis"] = "UTC"
     frame.attrs["resolved_timezone"] = payload.get("timezone")
     frame.attrs["api_response_utc_offset_seconds"] = payload.get(
         "utc_offset_seconds"
     )
-    # Keep a stable representation for downstream validation.
-    frame["time_utc"] = times_utc_python
+    # Drop the timezone only after filtering so resulting rows are positionally
+    # aligned with the retained local dates (never index-aligned to raw input).
+    frame["time_utc"] = frame["time_utc"].dt.tz_localize(None)
 
     return frame
 
@@ -1027,7 +1069,17 @@ def run_weather_etl(dry_run=False, airport_filter=None,
     print(" WEATHER ETL COMPLETED SUCCESSFULLY")
     print("=" * 70 + "\n")
 
-    return True
+    return {
+        "airports_processed": len(weather_records),
+        "airports_skipped": list(skipped),
+        "airports_failed": list(fetch_failures),
+        "rows_built": total_rows,
+        "rows_with_visibility": rows_with_visibility,
+        "rows_written": written,
+        "flights_considered": len(flights),
+        "flights_matched": matched,
+        "flights_unmatched": unmatched,
+    }
 
 
 if __name__ == "__main__":

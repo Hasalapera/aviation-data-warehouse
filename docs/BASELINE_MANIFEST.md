@@ -31,7 +31,7 @@ each file, captured **before any change** and re-verified afterwards:
 | File | SHA-256 |
 |---|---|
 | `etl.py` | `bd661d805996205a22a9521f437225816891f3c7798cbcd45d383c3fd78d4e15` |
-| `weather_etl.py` | `74455080579eccbeacd771f9f18e27f52312ead8244cfefd5f46d70800b0c61c`* |
+| `weather_etl.py` | `04b8becb5f7741587fc3577ea49ba037d809ff72a2f9bbdb7f799a353aa72dc3`* |
 | `oltp_etl.py` | `61ba95c058a9af8ae0543656a891bc6b74bb8e4ca58012aab51f785b436a9bed` |
 | `main_etl.py` | `9fa85f43ac25bc42e50f509319945b1b3099823785623dfaa4c9b35cfc6691cc` |
 | `setup_database.py` | `b1f89b6dcf04adf5d0cd16d6f1eda775836a8a8fd681f6dada987139ddbab05c` |
@@ -46,14 +46,16 @@ each file, captured **before any change** and re-verified afterwards:
 artifacts were introduced (P3). Everything else must match.
 
 \* `weather_etl.py` is the **one** protected-adjacent file approved for
-additive, default-preserving edits in P2: the shared
-`start_date_override=None` keyword and the per-airport
-`start_date_overrides=None` mapping. Final hash after the approved edits:
-`dbc47d62b371322655df1c703d1bac21c848b2f2c4e867a982a573a95cd70aa0`
+reviewed edits: additive P2 override kwargs, the archive end-date cap, the
+UTC/DST storage correction, and the P4 padded-request/logical-date filter.
+Final hash after the approved edits:
+`04b8becb5f7741587fc3577ea49ba037d809ff72a2f9bbdb7f799a353aa72dc3`
 (Phase-0 hash: `74455080...`; earlier approved hashes remain accepted by
-`tests/test_query_integrity.py`). Diff = additive kwargs + docstring +
-window clamping, with behaviour unchanged when both overrides are `None`.
-Every other file above must match exactly.
+`tests/test_query_integrity.py`). The P4 change requests one padded day on
+each side and filters by `time_local` back to the logical window; it does
+not shift timestamps, persist padded rows, or alter default outputs when
+the provider returns complete days. Every other file above must match
+exactly.
 
 ## Query result baseline
 

@@ -1,10 +1,11 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 import pandas as pd
 
 import etl
+import refresh_orchestrator as ro
 import weather_etl
 import weather_linker
 from timestamp_semantics import (
@@ -17,6 +18,30 @@ from timestamp_semantics import (
 
 
 UTC = timezone.utc
+
+
+def epoch_series(start, end):
+    values = []
+    current = start
+    while current <= end:
+        values.append(int(current.timestamp()))
+        current += timedelta(hours=1)
+    return values
+
+
+def archive_payload(start, end, tz_name):
+    start_utc = datetime.combine(start, datetime.min.time(), tzinfo=UTC)
+    end_utc = datetime.combine(end, datetime.max.time(), tzinfo=UTC)
+    end_utc = end_utc.replace(minute=0, second=0, microsecond=0)
+    times = epoch_series(start_utc, end_utc)
+    return {
+        "timezone": tz_name,
+        "utc_offset_seconds": 0,
+        "hourly": {
+            "time": times,
+            **{name: [1.0] * len(times) for name in weather_etl.HOURLY_VARIABLES},
+        },
+    }
 
 
 def archive_frame(*instants):
@@ -90,7 +115,7 @@ class TestFlightTimestampSemantics(unittest.TestCase):
         )
 
     def test_half_hour_zone_keeps_true_utc_instant(self):
-        instant = datetime(2025, 1, 9, 18, 30, tzinfo=UTC)
+        instant = datetime(2025, 1, 9, 6, 30, tzinfo=UTC)
         payload = {
             "timezone": "Asia/Colombo",
             "utc_offset_seconds": 19800,
@@ -110,8 +135,58 @@ class TestFlightTimestampSemantics(unittest.TestCase):
             "CMB", frame, None, timezone_name="Asia/Colombo"
         )
         self.assertEqual(
-            rows.iloc[0]["observation_time"], datetime(2025, 1, 9, 18, 30)
+            rows.iloc[0]["observation_time"], datetime(2025, 1, 9, 6, 30)
         )
+
+    def test_archive_request_padding_covers_dst_boundaries(self):
+        cases = (
+            ("2025-03-30", "2025-03-30", "Europe/London", 23),
+            ("2025-10-26", "2025-10-26", "Europe/London", 25),
+            ("2024-06-01", "2024-06-03", "Europe/London", 72),
+        )
+        for start, end, tz_name, expected_count in cases:
+            with self.subTest(start=start, end=end):
+                logical_start = date.fromisoformat(start)
+                logical_end = date.fromisoformat(end)
+                request_start, request_end = (
+                    weather_etl._padded_request_dates(logical_start, logical_end)
+                )
+                payload = archive_payload(
+                    request_start, request_end, tz_name
+                )
+                with mock.patch.object(
+                    weather_etl, "_request_json", return_value=payload
+                ) as request:
+                    frame = weather_etl.fetch_archive_weather(
+                        "LHR", weather_etl.AIRPORT_INFO["LHR"], start, end
+                    )
+                params = request.call_args.args[1]
+                self.assertEqual(
+                    params["start_date"],
+                    request_start.strftime("%Y-%m-%d"),
+                )
+                self.assertEqual(
+                    params["end_date"], request_end.strftime("%Y-%m-%d")
+                )
+                expected = ro.generate_expected_utc_instants(
+                    logical_start, logical_end, tz_name
+                )
+                self.assertEqual(len(expected), expected_count)
+                self.assertEqual(
+                    set(frame["time_utc"].dt.to_pydatetime()), set(expected)
+                )
+
+    def test_archive_request_bounds_are_clamped(self):
+        start, end = weather_etl._padded_request_dates(
+            date(1940, 1, 1), date(1940, 1, 1)
+        )
+        self.assertEqual(start, date(1940, 1, 1))
+        self.assertEqual(end, date(1940, 1, 2))
+
+        today = date.today()
+        start, end = weather_etl._padded_request_dates(today, today)
+        self.assertEqual(start, today - timedelta(days=1))
+        self.assertEqual(end, today)
 
     def test_iem_is_requested_in_utc(self):
         body = "station,valid,vsby\nVCBI,2025-01-12 05:50,0.16\n"
