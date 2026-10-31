@@ -1,0 +1,22 @@
+{
+  "policy_version": 1,
+  "comment": "Data Refresh Policy configuration. All stages enabled+required; weather chunk size 1000 (=weather_etl.INSERT_CHUNK_SIZE); incremental weather ON after safety validation (set weather_incremental.enabled=false to restore full-range fetching).",
+  "order": ["csv", "weather", "oltp"],
+  "sources": {
+    "csv":    { "enabled": true, "required": true },
+    "weather":{ "enabled": true, "required": true },
+    "oltp":   { "enabled": true, "required": true }
+  },
+  "failure_policy": "continue-on-stage-failure (same as main_etl.py): remaining stages still run; exit code is non-zero if any REQUIRED stage did not finish SUCCESS.",
+  "lock_timeout_seconds": 0,
+  "stale_running_minutes": 240,
+  "run_verification": true,
+  "verification_fails_run": true,
+  "csv_path": "data/flight.csv",
+  "weather_chunk_size": 1000,
+  "weather_incremental": {
+    "enabled": true,
+    "overlap_days": 7,
+    "comment": "Enabled in the shipped policy after the safety audit. Fetches weather from (per-airport watermark - overlap_days) instead of full flight history; set enabled=false to restore full-range fetching. Watermarks are written only after a successful stage + verification."
+  }
+}

@@ -83,11 +83,41 @@ CREATE TABLE IF NOT EXISTS dim_route (
 CREATE TABLE IF NOT EXISTS dim_weather (
     weather_key INT PRIMARY KEY AUTO_INCREMENT,
 
+    -- Historical weather identity (NULL for legacy/CSV-derived rows)
+    airport_key INT,
+    observation_time DATETIME,
+
     temperature DECIMAL(5,2),
     rainfall DECIMAL(6,2),
     wind_speed DECIMAL(6,2),
     visibility DECIMAL(6,2),
-    weather_condition VARCHAR(50)
+    weather_condition VARCHAR(50),
+
+    -- Additional reanalysis fields
+    relative_humidity DECIMAL(5,2),
+    cloud_cover DECIMAL(5,2),
+    weather_code SMALLINT,
+
+    -- Provenance. Visibility comes from a different source than the
+    -- reanalysis variables; see weather_etl.py.
+    visibility_source VARCHAR(50),
+    source_dataset VARCHAR(50),
+    source_model VARCHAR(50),
+    source_timezone VARCHAR(50),
+
+    CONSTRAINT fk_weather_airport
+        FOREIGN KEY (airport_key)
+        REFERENCES dim_airport(airport_key),
+
+    -- NULLs are permitted and do not conflict, so legacy rows are unaffected.
+    -- source_model is part of the identity so that a different model/version
+    -- can never overwrite another model's observation.
+    CONSTRAINT uq_weather_airport_time
+        UNIQUE (
+            airport_key, observation_time, source_dataset, source_model
+        ),
+
+    INDEX idx_weather_airport_time (airport_key, observation_time)
 );
 
 
@@ -99,6 +129,9 @@ CREATE TABLE IF NOT EXISTS fact_flight (
 
     flight_key BIGINT AUTO_INCREMENT PRIMARY KEY,
 
+    source_system VARCHAR(20),
+    source_flight_id VARCHAR(50),
+
     date_key INT NOT NULL,
     airline_key INT NOT NULL,
     route_key INT NOT NULL,
@@ -106,16 +139,23 @@ CREATE TABLE IF NOT EXISTS fact_flight (
 
     flight_number VARCHAR(20),
 
+    scheduled_departure DATETIME,
     departure_time DATETIME,
     arrival_time DATETIME,
 
     delay_minutes INT DEFAULT 0,
 
+    arrival_delay_minutes INT DEFAULT 0,
+
     flight_duration_minutes INT,
+
+    distance_km DECIMAL(8,2),
 
     passenger_count INT,
 
     cancelled_flag BOOLEAN DEFAULT FALSE,
+
+    diverted_flag BOOLEAN DEFAULT FALSE,
 
     CONSTRAINT fk_fact_date
         FOREIGN KEY (date_key)
@@ -133,7 +173,11 @@ CREATE TABLE IF NOT EXISTS fact_flight (
         FOREIGN KEY (weather_key)
         REFERENCES dim_weather(weather_key),
 
+    CONSTRAINT uq_fact_source
+        UNIQUE (source_system, source_flight_id),
+
     INDEX idx_fact_flight_number (flight_number),
+    INDEX idx_fact_scheduled_departure (scheduled_departure),
     INDEX idx_fact_date (date_key),
     INDEX idx_fact_airline (airline_key),
     INDEX idx_fact_route (route_key)

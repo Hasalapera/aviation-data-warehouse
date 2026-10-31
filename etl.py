@@ -9,6 +9,23 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(BASE_DIR, "data", "flight.csv")
 
 
+def _hhmm_to_minutes(series):
+    numeric = pd.to_numeric(series, errors="coerce")
+
+    hours = numeric // 100
+    minutes = numeric % 100
+
+    valid = (
+        numeric.notna()
+        & (hours >= 0)
+        & (hours <= 23)
+        & (minutes >= 0)
+        & (minutes <= 59)
+    )
+
+    return (hours * 60 + minutes).where(valid)
+
+
 def run_etl():
 
     print("\n" + "=" * 70)
@@ -492,24 +509,39 @@ def run_etl():
         # Datetime conversion
         # -----------------------------------------------------
 
-        df["clean_departure_time"] = pd.to_datetime(
-            df["flight_date"].astype(str)
-            + " "
-            + df["departure_time"]
-                .fillna("")
-                .astype(str),
-            errors="coerce",
-            format="mixed"
+        base_date = (
+            pd.to_datetime(df["flight_date"], errors="coerce")
+            .dt.normalize()
         )
 
-        df["clean_arrival_time"] = pd.to_datetime(
-            df["flight_date"].astype(str)
-            + " "
-            + df["arrival_time"]
-                .fillna("")
-                .astype(str),
-            errors="coerce",
-            format="mixed"
+        departure_minutes = _hhmm_to_minutes(df["departure_time"])
+        arrival_minutes = _hhmm_to_minutes(df["arrival_time"])
+
+        overnight = (
+            (arrival_minutes < departure_minutes)
+            & arrival_minutes.notna()
+            & departure_minutes.notna()
+        )
+
+        df["clean_departure_time"] = (
+            base_date
+            + pd.to_timedelta(departure_minutes, unit="m")
+        )
+
+        df["clean_arrival_time"] = (
+            base_date
+            + pd.to_timedelta(
+                arrival_minutes + overnight.astype("float64") * 1440,
+                unit="m"
+            )
+        )
+
+        df["clean_scheduled_departure"] = (
+            base_date
+            + pd.to_timedelta(
+                _hhmm_to_minutes(df["scheduled_departure"]),
+                unit="m"
+            )
         )
 
         # -----------------------------------------------------
@@ -517,59 +549,87 @@ def run_etl():
         # -----------------------------------------------------
 
         fact_records = pd.DataFrame({
+            "source_system": "csv",
+            "source_flight_id": df["flight_id"].astype(str),
             "date_key": df["date_key"],
             "airline_key": df["airline_key"],
             "route_key": df["route_key"],
             "weather_key": df["weather_key"],
             "flight_number": df["flight_number"],
+            "scheduled_departure": df["clean_scheduled_departure"],
             "departure_time": df["clean_departure_time"],
             "arrival_time": df["clean_arrival_time"],
             "delay_minutes": pd.to_numeric(
                 df["departure_delay_minutes"],
                 errors="coerce"
             ).fillna(0).astype(int),
+            "arrival_delay_minutes": pd.to_numeric(
+                df["arrival_delay_minutes"],
+                errors="coerce"
+            ).fillna(0).astype(int),
             "flight_duration_minutes": pd.to_numeric(
                 df["flight_duration_minutes"],
                 errors="coerce"
             ).fillna(0).astype(int),
+            "distance_km": pd.to_numeric(
+                df["distance_km"],
+                errors="coerce"
+            ),
             "passenger_count": None,
             "cancelled_flag": (
                 df["cancelled_flag"]
+                .fillna(False)
+                .astype(bool)
+            ),
+            "diverted_flag": (
+                df["diverted_flag"]
                 .fillna(False)
                 .astype(bool)
             )
         })
 
         # =====================================================
-        # 5. DUPLICATE PROTECTION
+        # 5. EXISTING RECORD PROTECTION
+        #    (idempotent by source identity, never by flight_number)
         # =====================================================
 
-        print("\n5. Checking existing flight numbers...")
+        print("\n5. Checking existing source identities...")
 
-        # Existing DW flights
-        existing_flights = pd.read_sql(
+        existing_sources = pd.read_sql(
             text("""
-                SELECT flight_number
+                SELECT source_system, source_flight_id
                 FROM fact_flight
+                WHERE source_flight_id IS NOT NULL
             """),
             conn
         )
 
-        existing_flights["flight_number"] = (
-            existing_flights["flight_number"]
-            .astype(str)
-            .str.strip()
+        existing_keys = set(
+            zip(
+                existing_sources["source_system"].astype(str),
+                existing_sources["source_flight_id"].astype(str)
+            )
         )
-
-        # -----------------------------------------------------
-        # Remove flights already in DW
-        # -----------------------------------------------------
 
         before_count = len(fact_records)
 
+        # The source flight_id is the row identity; a repeated flight_number
+        # is a legitimate distinct flight and must be preserved.
+        fact_records = (
+            fact_records
+            .drop_duplicates(
+                subset=["source_system", "source_flight_id"]
+            )
+            .copy()
+        )
+
         fact_records = fact_records[
-            ~fact_records["flight_number"].isin(
-                existing_flights["flight_number"]
+            ~fact_records.apply(
+                lambda row: (
+                    str(row["source_system"]),
+                    str(row["source_flight_id"])
+                ) in existing_keys,
+                axis=1
             )
         ].copy()
 
@@ -578,31 +638,8 @@ def run_etl():
         )
 
         print(
-            f" -> Existing CSV flights skipped: "
+            f" -> Existing CSV source records skipped: "
             f"{skipped_existing}"
-        )
-
-        # -----------------------------------------------------
-        # Remove duplicates inside CSV
-        # -----------------------------------------------------
-
-        before_internal = len(fact_records)
-
-        fact_records = (
-            fact_records
-            .drop_duplicates(
-                subset=["flight_number"]
-            )
-            .copy()
-        )
-
-        skipped_internal = (
-            before_internal - len(fact_records)
-        )
-
-        print(
-            f" -> Duplicate flight numbers inside CSV "
-            f"skipped: {skipped_internal}"
         )
 
         # =====================================================
