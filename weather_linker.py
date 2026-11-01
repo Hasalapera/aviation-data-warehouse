@@ -490,9 +490,10 @@ def read_candidate_rows(engine=None):
                     pass
 
 
-def preview_links(engine=None):
-    return build_link_plan(read_candidate_rows(engine))
-
+def preview_links(engine=None, source_semantics=None):
+    return build_link_plan(
+        read_candidate_rows(engine), source_semantics=source_semantics
+    )
 
 def pending_link_changes(plan):
     return [
@@ -781,11 +782,28 @@ def main(argv=None, target_engine=None, verifier=None):
         action="store_true",
         help="apply only matched weather_key changes with lock and audit",
     )
+    parser.add_argument(
+        "--proposed-standards",
+        "--project-standards",
+        dest="proposed_standards",
+        action="store_true",
+        help=(
+            "simulate linking under the adopted project standards (csv=origin_local, "
+            "oltp=utc). For dry-run simulation only; cannot be combined with --execute."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.execute and args.dry_run:
         print("[FATAL] choose either --dry-run or --execute, not both")
         return 2
+    if args.execute and args.proposed_standards:
+        print(
+            "[FATAL] project standards linking cannot be executed against production "
+            "without explicit operator authorization; use --dry-run only."
+        )
+        return 2
+
 
     if args.execute:
         if target_engine is None:
@@ -793,8 +811,12 @@ def main(argv=None, target_engine=None, verifier=None):
 
             target_engine = dw_engine
         return _execute(target_engine, verifier)
+    from timestamp_semantics import RECOMMENDED_SEMANTICS
 
-    plan = preview_links(target_engine)
+    source_semantics = (
+        RECOMMENDED_SEMANTICS if args.proposed_standards else None
+    )
+    plan = preview_links(target_engine, source_semantics=source_semantics)
     summary = summarize_plan(plan)
     _print_plan(plan, summary)
     print(

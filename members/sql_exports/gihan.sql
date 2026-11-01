@@ -64,25 +64,19 @@ SELECT
     d.`year`,
     d.`month`,
     d.month_name,
-    SUM(
-        CASE
-            WHEN f.cancelled_flag = 1 THEN 1
-            ELSE 0
-        END
-    ) AS cancelled_flights,
-    SUM(
-        CASE
-            WHEN f.cancelled_flag = 0 THEN 1
-            ELSE 0
-        END
-    ) AS operated_flights
+    CASE 
+        WHEN f.cancelled_flag = 1 THEN 'Cancelled'
+        ELSE 'Operated'
+    END AS flight_status,
+    COUNT(*) AS flight_count
 FROM fact_flight AS f
 JOIN dim_date AS d
     ON f.date_key = d.date_key
 GROUP BY
     d.`year`,
     d.`month`,
-    d.month_name
+    d.month_name,
+    flight_status
 ORDER BY
     d.`year`,
     d.`month`;
