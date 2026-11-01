@@ -1,0 +1,160 @@
+{
+  "generated_at": "2026-10-20T22:52:20",
+  "queries": {
+    "members/Kavindu.py:QUERY_ARRIVALS_VS_DEPARTURES": {
+      "file": "members/Kavindu.py",
+      "result_sha256": "33fe753ce086f74d0af6e02a07cc1ce59a99cad68503595a603191937eade56e",
+      "rows": 9,
+      "sql_sha256": "20ea462506720fb45a11a248f7a1d9b35cd65b4e21336ce8829543cae715c95c"
+    },
+    "members/Kavindu.py:QUERY_BUSIEST_ROUTES": {
+      "file": "members/Kavindu.py",
+      "result_sha256": "2ae88c6baa88b63d3db9a5f1e90fd08f3d8adb18e763278c82337794033630b2",
+      "rows": 10,
+      "sql_sha256": "0a72c574c29a1819c74aa990f914969ee58259b33170a784c75e0e4975bd4d9e"
+    },
+    "members/Kavindu.py:QUERY_CANCELLATIONS_BY_ROUTE": {
+      "file": "members/Kavindu.py",
+      "previous_result_sha256": "50083315c0418ea7a8485441068655f619fbe42f238e3eae50c09a2d73dd7d4a",
+      "rerecorded": "2026-10-20: query uses ORDER BY cancelled_flights DESC LIMIT 10 with ties at the row boundary (9 top rows tie at counts 2/1; 10 routes tie at count 0 for the final slot). After the additive audit DDL (etl_batch_log, etl_watermark) the chosen valid ordering changed. The pre-change hash was reproduced from the UNCHANGED current data by exhaustive search over all 156,630 valid tie orderings (match: SIN-CMB in slot 10 instead of CMB-DXB), proving no data change. This query's result hash remains tie-sensitive; a mismatch confined to this query indicates ordering, not data.",
+      "result_sha256": "b3ad3a66e7176d2ee0699de947700f515080b72e3d8429312dc70efa40f61bf0",
+      "rows": 10,
+      "sql_sha256": "4bd462f0015b552c7640190e2d452df32c94763ebcf132793948d48ace83f28d"
+    },
+    "members/Kavindu.py:QUERY_TOP_ORIGIN_AIRPORTS": {
+      "file": "members/Kavindu.py",
+      "result_sha256": "b57e31bb8125d52137e7effc840d6e0bb6f1517f9b2a5b7c30b081b89f2ab619",
+      "rows": 9,
+      "sql_sha256": "b46363e7998f8ffec3a253c525fd59b623abf70e1f8c7888c8f43e3bff25532a"
+    },
+    "members/Kavindu.py:QUERY_WORST_ROUTES_DELAY": {
+      "file": "members/Kavindu.py",
+      "result_sha256": "46cda132f721b687cf4adc803750db96e54bc591382b7294177d9bfb0d9259db",
+      "rows": 15,
+      "sql_sha256": "5ae9e634c2e9cb227ad232b4f4b71573da4d74c332d574a4b0cf9a2b22a2c7b8"
+    },
+    "members/gihan.py:QUERY_CANCELLED_VS_OPERATED": {
+      "file": "members/gihan.py",
+      "result_sha256": "e136e819828cf861e967189495703212926cbbaa4df5f3e4305b1870ee83b08e",
+      "rows": 14,
+      "sql_sha256": "d95b28cc532c5e2ec0b830a118f18c9cf4e90b3cf367de93ddfa472c8e85f0c1"
+    },
+    "members/gihan.py:QUERY_OVERALL_KPIS": {
+      "file": "members/gihan.py",
+      "result_sha256": "f744097f94596b5de07c89b89cceeb5f7a1de344972540462ccedbbfeec87ef1",
+      "rows": 1,
+      "sql_sha256": "4e66414e1f68f591175fe40086091ba0c82f1a5734a4357cc1af58ab19ab3cda"
+    },
+    "members/gihan.py:QUERY_PASSENGERS_BY_AIRLINE": {
+      "file": "members/gihan.py",
+      "result_sha256": "c92c0b63d0cefe8fd22d5ae94fc8e86f6aca836be695a22e93eade3e05ba018e",
+      "rows": 9,
+      "sql_sha256": "72a54ddf66dd9aa9b489521cd456fa996660576c3a805937c2eb36e70562821d"
+    },
+    "members/gihan.py:QUERY_PASSENGERS_VS_DELAY": {
+      "file": "members/gihan.py",
+      "result_sha256": "bf10d90e9f59f77fb06d6cba0ee5d56f908ff801ad19148704cffbd5bc212dba",
+      "rows": 3,
+      "sql_sha256": "4e72cc3a2ba03b0d12920b56e192cc7dd81e1e0f0752ad06cd2b92fcccf4b0ff"
+    },
+    "members/gihan.py:QUERY_TOP_ROUTES_PASSENGERS": {
+      "file": "members/gihan.py",
+      "result_sha256": "e36e3b723e1083ff3fd5aa1b63d6f803a2be6cfecd14469a7052cede31a6cb57",
+      "rows": 10,
+      "sql_sha256": "acc3af9bdc962a0038e2947077266103ba4f9c907f87cef25130fe4471957f11"
+    },
+    "members/hasala.py:QUERY_AIRLINE_METRICS": {
+      "file": "members/hasala.py",
+      "result_sha256": "036e3274974d662bf63c126facfde403406b4440830ea19ae1d9d00449d9f61e",
+      "rows": 9,
+      "sql_sha256": "1dc86472d23f4a22e90d9759087cc76bd26bfd2539490497b6cc0839c38de5a7"
+    },
+    "members/hasala.py:QUERY_CANCELLATION_RATE": {
+      "file": "members/hasala.py",
+      "result_sha256": "be0bfa05590d6e2d640dee3e11e584db42c72e6b38688e97be7550d8a88fda4c",
+      "rows": 9,
+      "sql_sha256": "0ca24347295f9ef4d472ec0faaf8dd5ae3308ddd7c823f86fe988c770bc6f226"
+    },
+    "members/hasala.py:QUERY_DELAY_SEVERITY": {
+      "file": "members/hasala.py",
+      "result_sha256": "2f273df8cb96a7a158c915560f7a5f8ed656d3e82b425ae04bcc501571c7963a",
+      "rows": 9,
+      "sql_sha256": "07d138b6324ac7d52068986471c3c1c0411e16fc00a2d99f8b5a329484236ff1"
+    },
+    "members/hasala.py:QUERY_DELAY_TREND_QUARTERS": {
+      "file": "members/hasala.py",
+      "result_sha256": "658baf56c9e013561f863c68a626e02f5a85258e76376e3b586190c458b4c27c",
+      "rows": 36,
+      "sql_sha256": "a322298c6c25729e3d66dea7dcffb799b97137f6afab4674f4bd294f8135d22e"
+    },
+    "members/hasala.py:QUERY_FLIGHTS_VS_PASSENGERS": {
+      "file": "members/hasala.py",
+      "result_sha256": "de2dcd61a85f6a0c9fb1cc1049e85c390a1ae5870ba53ad4d1812c1b3c276775",
+      "rows": 9,
+      "sql_sha256": "5608d80aa0d928d3778604aab9f1f6fbcdeb94b863e6eabd131fc37d0ee26852"
+    },
+    "members/navodya.py:QUERY_DELAY_BY_WEEKDAY": {
+      "file": "members/navodya.py",
+      "result_sha256": "8bd3432adb00882435286b0c7f915d917781beca029417454ba7ae3a7efe5bfc",
+      "rows": 7,
+      "sql_sha256": "73b2630225c7ed6b332a5fc8b58e3a30420988c86d0e97616cd011dadc2c6a3c"
+    },
+    "members/navodya.py:QUERY_FLIGHTS_BY_TIME_BUCKET": {
+      "file": "members/navodya.py",
+      "result_sha256": "7cbd420844c8bb0ce45d68747d8ac8fd384f806a603cd224c6078acb476c1d86",
+      "rows": 4,
+      "sql_sha256": "007d18fb3521e6b8ea09d00e57918448207555f9d182dbbfcd1d5f0e9b478676"
+    },
+    "members/navodya.py:QUERY_MONTHLY_FLIGHT_VOLUME": {
+      "file": "members/navodya.py",
+      "result_sha256": "7445a40bc6aed753a352cfe8941b98e3a85b0223dccf71f3ae1320d79746bb5e",
+      "rows": 14,
+      "sql_sha256": "359ea22152b0987ca3d7675b0827b08858edd09ea16f9f2aeb944e095b5f9fda"
+    },
+    "members/navodya.py:QUERY_MONTH_WEEKDAY_DELAY": {
+      "file": "members/navodya.py",
+      "result_sha256": "ec870f224a0c1753c7433a9591655b260b831dc49cb4678b83b1e581a089e71a",
+      "rows": 84,
+      "sql_sha256": "1f275905e716056fd8c1cbe65fd5f7356011f2013f338b018ea9f1b71c68b288"
+    },
+    "members/navodya.py:QUERY_QUARTERLY_ONTIME_RATE": {
+      "file": "members/navodya.py",
+      "result_sha256": "a77b6f75a490ec44cb29594e07c852bf85be2426914406f33c591a06451b82e8",
+      "rows": 5,
+      "sql_sha256": "78b681a100532af8427ed1e4ee6df1f3570a8f90ba59f19ce90261b42bf8f270"
+    },
+    "members/sadeepa.py:QUERY_CANCELLATION_BY_WEATHER": {
+      "file": "members/sadeepa.py",
+      "result_sha256": "86e118b620ab6f09c0bd21e20f1139b42b8aff3e07a6d3221b62aea94cae466b",
+      "rows": 5,
+      "sql_sha256": "edea5dee630afe635dd6c880431034badc3043eb69d3747acdf058367d399151"
+    },
+    "members/sadeepa.py:QUERY_DELAY_BY_WEATHER": {
+      "file": "members/sadeepa.py",
+      "result_sha256": "b252a90718fc33c9ce70c3bda0cfb4a0ad662612c1f4b9b631ba6965c8774fee",
+      "rows": 5,
+      "sql_sha256": "117eac3e7f469694d4f1e5d16e62c3ac6a82e227207eca1edeb70d5059148500"
+    },
+    "members/sadeepa.py:QUERY_RAINFALL_VS_DELAY": {
+      "file": "members/sadeepa.py",
+      "result_sha256": "c831234df54fba7554053816f2c509e021ba6db99c3bd1b97da62522f4de3a13",
+      "rows": 115,
+      "sql_sha256": "2779ea584e6d67e10e43204910223ecdd4991b04faba1fd083a4217e89354dc2"
+    },
+    "members/sadeepa.py:QUERY_TEMPERATURE_VS_DELAY": {
+      "file": "members/sadeepa.py",
+      "result_sha256": "a377e59a5bc93451c88a7bed7a39d01fc7d7630375d6c79a104b0d94f75c77ba",
+      "rows": 146,
+      "sql_sha256": "6bd9f4743761c7a7f279de54ec080ba4e571549cc0cb5aed0149b52468303c8c"
+    },
+    "members/sadeepa.py:QUERY_VISIBILITY_VS_DELAY": {
+      "file": "members/sadeepa.py",
+      "result_sha256": "343d4a9d1ec7e880d2af5bd589173dff5165803c5bc19accc4aeddbad76c708d",
+      "rows": 2,
+      "sql_sha256": "30b7782871911a20d5b5743eb2c48ea4461afba96a892f8b56350c5fdb2170b1"
+    }
+  },
+  "query_count": 25,
+  "rerecorded_at": "2026-10-20T23:45:00",
+  "warehouse": "aviation_dw"
+}

@@ -81,6 +81,7 @@ SELECT
     END AS time_bucket,
     COUNT(f.flight_key) AS total_flights
 FROM fact_flight f
+WHERE f.scheduled_departure IS NOT NULL
 GROUP BY
     CASE
         WHEN HOUR(f.scheduled_departure) < 6 THEN '00-06'

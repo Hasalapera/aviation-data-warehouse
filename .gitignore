@@ -13,3 +13,14 @@ ca.pem
 
 *.pyo
 
+    
+logs/
+scripts/launchd/*.plist
+
+
+# Other compiled Python files
+*.pyd
+
+# Environment-specific secret files
+.env.*
+!.env.example

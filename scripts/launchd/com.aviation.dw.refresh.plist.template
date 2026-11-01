@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template: DAILY warehouse refresh (P3).
+
+  *** NOT INSTALLED. This file is a template only; nothing loads it. ***
+  Enabling a schedule is an explicit operator action. This is the ONLY
+  supported LaunchAgent: do not also install the retired weather-only job.
+
+  To enable (macOS):
+    1. mkdir -p __REPO_PATH__/logs ~/Library/LaunchAgents
+    2. Replace __REPO_PATH__ everywhere in this file with the absolute
+       path to this repository, for example:
+         sed "s|__REPO_PATH__|$PWD|g" \
+           scripts/launchd/com.aviation.dw.refresh.plist.template \
+           > ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
+    3. launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
+    4. Verify: launchctl print gui/$(id -u)/com.aviation.dw.refresh
+    5. Optional immediate run:
+         launchctl kickstart -k gui/$(id -u)/com.aviation.dw.refresh
+
+  To disable again:
+    launchctl bootout gui/$(id -u)/com.aviation.dw.refresh
+    rm ~/Library/LaunchAgents/com.aviation.dw.refresh.plist
+
+  If the label is already loaded, bootstrap fails. Run `launchctl print`
+  first and `launchctl bootout` before bootstrapping again.
+
+  Timezone:
+  - StartCalendarInterval uses the Mac's CURRENT SYSTEM TIMEZONE. launchd
+    has no per-job timezone. This template says 02:00; that is Asia/Colombo
+    time only when the host timezone is Asia/Colombo. Check the host with:
+      readlink /etc/localtime
+    Adjust Hour/Minute or the host timezone if they differ.
+
+  Logs:
+  - The wrapper creates a per-run file under logs/ and also writes the
+    orchestrator exit code there.
+  - StandardOutPath/StandardErrorPath capture launchd-level messages only.
+  - The wrapper and orchestrator never print credentials; logs are
+    git-ignored. Per-run logs are pruned by Python; launchd_* files are
+    never pruned automatically.
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.aviation.dw.refresh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>__REPO_PATH__/scripts/scheduled_refresh.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO_PATH__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+      <key>Hour</key>
+      <integer>2</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+
+    <!-- a still-running previous run makes this launch exit 3 (locked) -->
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_PATH__/logs/launchd_refresh.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_PATH__/logs/launchd_refresh.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+  </dict>
+</plist>
