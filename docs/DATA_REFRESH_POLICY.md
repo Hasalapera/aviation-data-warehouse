@@ -93,7 +93,9 @@ silently using a different window or accidentally activating the mode.
   partial range.
 - Fetch end per airport is `min(airport's last flight date, archive's
   latest available day)`. Flights outside archive coverage (e.g. future
-  flights) never inflate a watermark.
+  flights) never inflate a watermark. The API request's one-day forward
+  padding is clamped to the same archive maximum, so it can never request
+  today's not-yet-archived date.
 - Watermarks advance **only after** the weather stage completed as
   `SUCCESS` **and** post-load verification actually ran and did not fail.
   A `PARTIAL` or `FAILED` weather stage, a failed verification, or skipped

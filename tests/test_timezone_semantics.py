@@ -183,10 +183,55 @@ class TestFlightTimestampSemantics(unittest.TestCase):
         self.assertEqual(start, date(1940, 1, 1))
         self.assertEqual(end, date(1940, 1, 2))
 
-        today = date.today()
-        start, end = weather_etl._padded_request_dates(today, today)
-        self.assertEqual(start, today - timedelta(days=1))
-        self.assertEqual(end, today)
+        archive_max = date(2026, 11, 2)
+        with mock.patch.object(
+            weather_etl, "ARCHIVE_MAX_DATE", archive_max
+        ):
+            start, end = weather_etl._padded_request_dates(
+                date(2026, 10, 23), date(2026, 10, 30)
+            )
+            self.assertEqual(start, date(2026, 10, 22))
+            self.assertEqual(end, date(2026, 10, 31))
+
+            start, end = weather_etl._padded_request_dates(
+                archive_max, archive_max
+            )
+            self.assertEqual(start, archive_max - timedelta(days=1))
+            self.assertEqual(end, archive_max)
+
+    def test_future_flight_span_request_does_not_exceed_archive_max(self):
+        archive_max = date(2026, 11, 2)
+        logical_start = date(2026, 10, 23)
+        future_flight_end = date(2026, 12, 7)
+
+        with mock.patch.object(
+            weather_etl, "ARCHIVE_MAX_DATE", archive_max
+        ):
+            padded_start, padded_end = weather_etl._padded_request_dates(
+                logical_start, future_flight_end
+            )
+            self.assertEqual(padded_start, date(2026, 10, 22))
+            self.assertEqual(padded_end, archive_max)
+
+            payload = archive_payload(
+                padded_start, padded_end, "Asia/Colombo"
+            )
+            with mock.patch.object(
+                weather_etl, "_request_json", return_value=payload
+            ) as request:
+                weather_etl.fetch_archive_weather(
+                    "CMB",
+                    weather_etl.AIRPORT_INFO["CMB"],
+                    logical_start,
+                    min(future_flight_end, archive_max),
+                )
+
+        params = request.call_args.args[1]
+        self.assertEqual(params["start_date"], "2026-10-22")
+        self.assertEqual(params["end_date"], "2026-11-02")
+        self.assertLessEqual(
+            date.fromisoformat(params["end_date"]), archive_max
+        )
 
     def test_iem_is_requested_in_utc(self):
         body = "station,valid,vsby\nVCBI,2025-01-12 05:50,0.16\n"
