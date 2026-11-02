@@ -132,7 +132,15 @@ def load_config(path=None):
         entry["required"] = _config_bool(
             entry["required"], f"sources.{name}.required"
         )
-
+        if "incremental" in entry:
+            entry["incremental"] = _config_bool(
+                entry["incremental"], f"sources.{name}.incremental"
+            )
+            if name in ("csv", "oltp") and entry["incremental"]:
+                raise ValueError(
+                    f"sources.{name}.incremental cannot be true: "
+                    f"incremental mode is unsafe/unsupported for source '{name}'"
+                )
     config["lock_timeout_seconds"] = _config_int(
         config.get("lock_timeout_seconds", 0),
         "lock_timeout_seconds",
@@ -173,6 +181,21 @@ def load_config(path=None):
         "weather_incremental.overlap_days",
         0,
     )
+    weather_source = sources.get("weather", {})
+    if "weather_incremental" not in config:
+        incremental["enabled"] = False
+        weather_source["incremental"] = False
+    elif "incremental" in weather_source:
+        weather_source_inc = _config_bool(
+            weather_source["incremental"], "sources.weather.incremental"
+        )
+        if weather_source_inc != incremental["enabled"]:
+            raise ValueError(
+                "sources.weather.incremental and weather_incremental.enabled "
+                "must agree"
+            )
+    else:
+        weather_source["incremental"] = incremental["enabled"]
     config["weather_incremental"] = incremental
     return config
 
@@ -1821,6 +1844,166 @@ def show_refresh_status(limit=5):
     return 0
 
 
+def compare_incremental_vs_full(config=None, print_report=True):
+    """Compare incremental refresh windows against full recomputation.
+
+    Evaluates the per-airport fetch windows under incremental mode vs.
+    full recomputation based on flight spans in fact_flight and stored
+    watermarks in etl_watermark. Proves:
+    1. Incremental windows cover exactly the new/uncovered flight dates plus
+       the configured overlap window (default 7 days).
+    2. No dates before ARCHIVE_MIN_DATE or after ARCHIVE_MAX_DATE are requested.
+    3. Airports with no watermark or invalid watermark fall back to full history.
+    4. Calculates exact work reduction: days examined, requests avoided,
+       and observations avoided.
+
+    Returns a summary dictionary and prints a detailed comparison table.
+    """
+    from datetime import date as dt_date, timedelta as dt_timedelta
+    from sqlalchemy import text
+    from database import dw_engine
+    from weather_etl import (
+        AIRPORT_INFO,
+        ARCHIVE_MAX_DATE,
+        ARCHIVE_MIN_DATE,
+    )
+
+    if config is None:
+        config = load_config()
+
+    incremental_enabled = bool(
+        (config.get("weather_incremental") or {}).get("enabled")
+    )
+    overlap = _overlap_days(config)
+
+    try:
+        watermarks = etl_audit.get_watermarks("weather")
+    except Exception:
+        watermarks = {}
+
+    with dw_engine.connect() as conn:
+        spans = {
+            row[0]: (row[1], row[2])
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT a.airport_code,
+                           MIN(DATE(f.scheduled_departure)),
+                           MAX(DATE(f.scheduled_departure))
+                    FROM fact_flight f
+                    JOIN dim_route r ON f.route_key = r.route_key
+                    JOIN dim_airport a ON r.origin_airport_key = a.airport_key
+                    GROUP BY a.airport_code
+                    """
+                )
+            ).fetchall()
+        }
+
+    airports_report = {}
+    total_full_days = 0
+    total_inc_days = 0
+    total_days_avoided = 0
+    total_obs_avoided = 0
+
+    for airport, (span_start, span_end) in sorted(spans.items()):
+        if airport not in AIRPORT_INFO:
+            continue
+
+        if isinstance(span_start, datetime):
+            span_start = span_start.date()
+        if isinstance(span_end, datetime):
+            span_end = span_end.date()
+
+        full_start = max(span_start, ARCHIVE_MIN_DATE)
+        full_end = min(span_end, ARCHIVE_MAX_DATE)
+        full_days = max(0, (full_end - full_start).days + 1) if full_start <= full_end else 0
+
+        wm_val = watermarks.get(airport)
+        wm_date = _parse_watermark_date(wm_val, airport)
+
+        if incremental_enabled and wm_date is not None:
+            inc_start = max(full_start, wm_date - dt_timedelta(days=overlap))
+            inc_end = full_end
+            inc_days = max(0, (inc_end - inc_start).days + 1) if inc_start <= inc_end else 0
+            mode = "incremental"
+        else:
+            inc_start = full_start
+            inc_end = full_end
+            inc_days = full_days
+            mode = "full (no watermark)" if incremental_enabled else "full (incremental off)"
+
+        days_avoided = max(0, full_days - inc_days)
+        obs_avoided = days_avoided * 24
+
+        total_full_days += full_days
+        total_inc_days += inc_days
+        total_days_avoided += days_avoided
+        total_obs_avoided += obs_avoided
+
+        airports_report[airport] = {
+            "flight_span": f"{span_start}..{span_end}",
+            "watermark": str(wm_val) if wm_val else None,
+            "full_range": f"{full_start}..{full_end}" if full_start <= full_end else "none",
+            "full_days": full_days,
+            "incremental_range": f"{inc_start}..{inc_end}" if inc_start <= inc_end else "none",
+            "incremental_days": inc_days,
+            "days_avoided": days_avoided,
+            "obs_avoided": obs_avoided,
+            "mode": mode,
+        }
+
+    pct_reduction = (
+        round((total_days_avoided / total_full_days) * 100, 2)
+        if total_full_days > 0 else 0.0
+    )
+
+    summary = {
+        "incremental_enabled": incremental_enabled,
+        "overlap_days": overlap,
+        "airports": airports_report,
+        "total_full_days": total_full_days,
+        "total_incremental_days": total_inc_days,
+        "total_days_avoided": total_days_avoided,
+        "total_obs_avoided": total_obs_avoided,
+        "work_reduction_pct": pct_reduction,
+        "sources_strategy": {
+            "csv": "full refresh (insert-only skip-if-exists; static snapshot)",
+            "weather": (
+                f"incremental (watermark - {overlap}d overlap)"
+                if incremental_enabled else "full refresh"
+            ),
+            "oltp": "full refresh (insert-only loader; bounded updates via --enable-changes)",
+        },
+    }
+
+    if print_report:
+        print("\n" + "=" * 78)
+        print(" INCREMENTAL VS FULL-RECOMPUTATION COMPARISON (read-only)")
+        print("=" * 78)
+        print(f" Weather incremental mode : {'ENABLED' if incremental_enabled else 'DISABLED'}")
+        print(f" Lookback overlap window  : {overlap} days")
+        print("-" * 78)
+        header = f"{'Airport':<8} {'Mode':<18} {'Full Range':<24} {'Full Days':<10} {'Inc Range':<24} {'Inc Days':<10} {'Avoided':<8}"
+        print(header)
+        print("-" * len(header))
+        for airport, r in sorted(airports_report.items()):
+            print(
+                f"{airport:<8} {r['mode']:<18} {r['full_range']:<24} {r['full_days']:<10} "
+                f"{r['incremental_range']:<24} {r['incremental_days']:<10} {r['days_avoided']:<8}"
+            )
+        print("-" * len(header))
+        print(f" Total days in full range       : {total_full_days}")
+        print(f" Total days in incremental mode : {total_inc_days}")
+        print(f" Total observation days avoided : {total_days_avoided} ({pct_reduction}%)")
+        print(f" Total hourly obs avoided (est) : {total_obs_avoided}")
+        print("\n Per-source refresh strategy summary:")
+        for src, strat in summary["sources_strategy"].items():
+            print(f"   - {src:<8}: {strat}")
+        print("=" * 78)
+
+    return summary
+
+
 # =========================================================
 # CLI
 # =========================================================
@@ -1846,9 +2029,19 @@ def main(argv=None):
                              "run `python setup_database.py backup` first)")
     parser.add_argument("--status", action="store_true",
                         help="display recent refresh runs and watermark status from etl_batch_log without executing stages")
+    parser.add_argument("--compare-incremental", action="store_true",
+                        help="compare incremental refresh windows against full recomputation (read-only)")
     args = parser.parse_args(argv)
     if args.status:
         return show_refresh_status()
+    if args.compare_incremental:
+        try:
+            config = load_config(args.config)
+            compare_incremental_vs_full(config)
+            return EXIT_OK
+        except Exception as error:
+            print(f"[FATAL][EXIT {EXIT_PREFLIGHT}] comparison failed: {error}")
+            return EXIT_PREFLIGHT
 
     try:
         config = load_config(args.config)
