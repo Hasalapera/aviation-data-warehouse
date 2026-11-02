@@ -548,6 +548,27 @@ def run_etl():
         # Fact table dataframe
         # -----------------------------------------------------
 
+        passenger_counts = pd.to_numeric(
+            df["passenger_count"],
+            errors="coerce"
+        )
+
+        if passenger_counts.isna().any():
+            raise ValueError(
+                "CSV passenger_count must be numeric and non-null "
+                "for every row."
+            )
+
+        if (passenger_counts < 0).any():
+            raise ValueError(
+                "CSV passenger_count must not be negative."
+            )
+
+        if (passenger_counts != passenger_counts.round()).any():
+            raise ValueError(
+                "CSV passenger_count must contain whole numbers."
+            )
+
         fact_records = pd.DataFrame({
             "source_system": "csv",
             "source_flight_id": df["flight_id"].astype(str),
@@ -575,7 +596,7 @@ def run_etl():
                 df["distance_km"],
                 errors="coerce"
             ),
-            "passenger_count": None,
+            "passenger_count": passenger_counts.astype(int),
             "cancelled_flag": (
                 df["cancelled_flag"]
                 .fillna(False)
