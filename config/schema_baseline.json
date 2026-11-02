@@ -1,0 +1,663 @@
+{
+  "database": "aviation_dw",
+  "generated_at": "2026-10-20T23:00:50",
+  "inventory": {
+    "dim_airline": {
+      "columns": [
+        {
+          "default": null,
+          "extra": "auto_increment",
+          "key": "PRI",
+          "name": "airline_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "airline_code",
+          "nullable": "NO",
+          "type": "varchar(10)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "airline_name",
+          "nullable": "NO",
+          "type": "varchar(100)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "country",
+          "nullable": "YES",
+          "type": "varchar(100)"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "column": "airline_key",
+          "name": "PRIMARY",
+          "seq": 1,
+          "unique": true
+        }
+      ]
+    },
+    "dim_airport": {
+      "columns": [
+        {
+          "default": null,
+          "extra": "auto_increment",
+          "key": "PRI",
+          "name": "airport_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "UNI",
+          "name": "airport_code",
+          "nullable": "NO",
+          "type": "varchar(10)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "airport_name",
+          "nullable": "NO",
+          "type": "varchar(150)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "city",
+          "nullable": "YES",
+          "type": "varchar(100)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "country",
+          "nullable": "YES",
+          "type": "varchar(100)"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "column": "airport_key",
+          "name": "PRIMARY",
+          "seq": 1,
+          "unique": true
+        },
+        {
+          "column": "airport_code",
+          "name": "uq_airport_code",
+          "seq": 1,
+          "unique": true
+        }
+      ]
+    },
+    "dim_date": {
+      "columns": [
+        {
+          "default": null,
+          "extra": "",
+          "key": "PRI",
+          "name": "date_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "full_date",
+          "nullable": "NO",
+          "type": "date"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "day",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "month",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "month_name",
+          "nullable": "YES",
+          "type": "varchar(20)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "quarter",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "year",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "day_name",
+          "nullable": "YES",
+          "type": "varchar(20)"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "column": "date_key",
+          "name": "PRIMARY",
+          "seq": 1,
+          "unique": true
+        }
+      ]
+    },
+    "dim_route": {
+      "columns": [
+        {
+          "default": null,
+          "extra": "auto_increment",
+          "key": "PRI",
+          "name": "route_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "origin_airport_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "destination_airport_key",
+          "nullable": "NO",
+          "type": "int"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "destination_airport_key",
+          "name": "fk_route_destination",
+          "ref_column": "airport_key",
+          "ref_table": "dim_airport"
+        },
+        {
+          "column": "origin_airport_key",
+          "name": "fk_route_origin",
+          "ref_column": "airport_key",
+          "ref_table": "dim_airport"
+        }
+      ],
+      "indexes": [
+        {
+          "column": "destination_airport_key",
+          "name": "fk_route_destination",
+          "seq": 1,
+          "unique": false
+        },
+        {
+          "column": "route_key",
+          "name": "PRIMARY",
+          "seq": 1,
+          "unique": true
+        },
+        {
+          "column": "origin_airport_key",
+          "name": "uq_route",
+          "seq": 1,
+          "unique": true
+        },
+        {
+          "column": "destination_airport_key",
+          "name": "uq_route",
+          "seq": 2,
+          "unique": true
+        }
+      ]
+    },
+    "dim_weather": {
+      "columns": [
+        {
+          "default": null,
+          "extra": "auto_increment",
+          "key": "PRI",
+          "name": "weather_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "temperature",
+          "nullable": "YES",
+          "type": "decimal(5,2)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "rainfall",
+          "nullable": "YES",
+          "type": "decimal(6,2)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "wind_speed",
+          "nullable": "YES",
+          "type": "decimal(6,2)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "visibility",
+          "nullable": "YES",
+          "type": "decimal(6,2)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "weather_condition",
+          "nullable": "YES",
+          "type": "varchar(50)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "airport_key",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "observation_time",
+          "nullable": "YES",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "relative_humidity",
+          "nullable": "YES",
+          "type": "decimal(5,2)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "cloud_cover",
+          "nullable": "YES",
+          "type": "decimal(5,2)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "weather_code",
+          "nullable": "YES",
+          "type": "smallint"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "visibility_source",
+          "nullable": "YES",
+          "type": "varchar(50)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "source_dataset",
+          "nullable": "YES",
+          "type": "varchar(50)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "source_model",
+          "nullable": "YES",
+          "type": "varchar(50)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "source_timezone",
+          "nullable": "YES",
+          "type": "varchar(50)"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "airport_key",
+          "name": "fk_weather_airport",
+          "ref_column": "airport_key",
+          "ref_table": "dim_airport"
+        }
+      ],
+      "indexes": [
+        {
+          "column": "airport_key",
+          "name": "idx_weather_airport_time",
+          "seq": 1,
+          "unique": false
+        },
+        {
+          "column": "observation_time",
+          "name": "idx_weather_airport_time",
+          "seq": 2,
+          "unique": false
+        },
+        {
+          "column": "weather_key",
+          "name": "PRIMARY",
+          "seq": 1,
+          "unique": true
+        },
+        {
+          "column": "airport_key",
+          "name": "uq_weather_airport_time",
+          "seq": 1,
+          "unique": true
+        },
+        {
+          "column": "observation_time",
+          "name": "uq_weather_airport_time",
+          "seq": 2,
+          "unique": true
+        },
+        {
+          "column": "source_dataset",
+          "name": "uq_weather_airport_time",
+          "seq": 3,
+          "unique": true
+        },
+        {
+          "column": "source_model",
+          "name": "uq_weather_airport_time",
+          "seq": 4,
+          "unique": true
+        }
+      ]
+    },
+    "fact_flight": {
+      "columns": [
+        {
+          "default": null,
+          "extra": "auto_increment",
+          "key": "PRI",
+          "name": "flight_key",
+          "nullable": "NO",
+          "type": "bigint"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "source_system",
+          "nullable": "YES",
+          "type": "varchar(20)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "source_flight_id",
+          "nullable": "YES",
+          "type": "varchar(50)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "date_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "airline_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "route_key",
+          "nullable": "NO",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "weather_key",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "flight_number",
+          "nullable": "YES",
+          "type": "varchar(20)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "MUL",
+          "name": "scheduled_departure",
+          "nullable": "YES",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "departure_time",
+          "nullable": "YES",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "arrival_time",
+          "nullable": "YES",
+          "type": "datetime"
+        },
+        {
+          "default": "0",
+          "extra": "",
+          "key": "",
+          "name": "delay_minutes",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": "0",
+          "extra": "",
+          "key": "",
+          "name": "arrival_delay_minutes",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "flight_duration_minutes",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "distance_km",
+          "nullable": "YES",
+          "type": "decimal(8,2)"
+        },
+        {
+          "default": null,
+          "extra": "",
+          "key": "",
+          "name": "passenger_count",
+          "nullable": "YES",
+          "type": "int"
+        },
+        {
+          "default": "0",
+          "extra": "",
+          "key": "",
+          "name": "cancelled_flag",
+          "nullable": "YES",
+          "type": "tinyint(1)"
+        },
+        {
+          "default": "0",
+          "extra": "",
+          "key": "",
+          "name": "diverted_flag",
+          "nullable": "YES",
+          "type": "tinyint(1)"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "date_key",
+          "name": "fact_flight_ibfk_1",
+          "ref_column": "date_key",
+          "ref_table": "dim_date"
+        },
+        {
+          "column": "airline_key",
+          "name": "fact_flight_ibfk_2",
+          "ref_column": "airline_key",
+          "ref_table": "dim_airline"
+        },
+        {
+          "column": "route_key",
+          "name": "fact_flight_ibfk_3",
+          "ref_column": "route_key",
+          "ref_table": "dim_route"
+        },
+        {
+          "column": "weather_key",
+          "name": "fact_flight_ibfk_4",
+          "ref_column": "weather_key",
+          "ref_table": "dim_weather"
+        }
+      ],
+      "indexes": [
+        {
+          "column": "airline_key",
+          "name": "airline_key",
+          "seq": 1,
+          "unique": false
+        },
+        {
+          "column": "date_key",
+          "name": "date_key",
+          "seq": 1,
+          "unique": false
+        },
+        {
+          "column": "scheduled_departure",
+          "name": "idx_fact_scheduled_departure",
+          "seq": 1,
+          "unique": false
+        },
+        {
+          "column": "flight_key",
+          "name": "PRIMARY",
+          "seq": 1,
+          "unique": true
+        },
+        {
+          "column": "route_key",
+          "name": "route_key",
+          "seq": 1,
+          "unique": false
+        },
+        {
+          "column": "source_system",
+          "name": "uq_fact_source",
+          "seq": 1,
+          "unique": true
+        },
+        {
+          "column": "source_flight_id",
+          "name": "uq_fact_source",
+          "seq": 2,
+          "unique": true
+        },
+        {
+          "column": "weather_key",
+          "name": "weather_key",
+          "seq": 1,
+          "unique": false
+        }
+      ]
+    }
+  },
+  "tables": [
+    "dim_date",
+    "dim_airline",
+    "dim_airport",
+    "dim_route",
+    "dim_weather",
+    "fact_flight"
+  ]
+}

@@ -9,6 +9,14 @@ import requests
 from sqlalchemy import text
 
 from database import dw_engine
+from timestamp_semantics import (
+    FLIGHT_TIMESTAMP_SEMANTICS,
+    AmbiguousLocalTime,
+    InvalidTimestamp,
+    NonexistentLocalTime,
+    flight_utc_hour,
+    utc_zone,
+)
 
 
 # ==========================================
@@ -24,7 +32,13 @@ IEM_ASOS_URL = (
 # direct airport observation. The default "best_match" blend combines
 # ECMWF IFS HRES, ERA5 and ERA5-Land.
 ARCHIVE_SOURCE_DATASET = "open-meteo-archive"
+# Legacy rows stored a fixed-offset local wall-clock label in
+# observation_time. They are preserved and must not be relinked.
 ARCHIVE_SOURCE_MODEL = "best_match"
+# New rows store the true UTC instant in observation_time. The versioned
+# model keeps corrected rows separate from legacy fixed-offset rows without
+# a schema migration.
+ARCHIVE_UTC_SOURCE_MODEL = "best_match_utc_v1"
 
 # Visibility is absent from the Open-Meteo historical archive. We use real
 # METAR/ASOS surface observations from the Iowa Environmental Mesonet
@@ -51,7 +65,7 @@ INSERT_CHUNK_SIZE = 1000
 # window return HTTP 400, so flight date ranges are clamped to it. Future
 # flights simply have no observation available and remain unmatched.
 ARCHIVE_MIN_DATE = date(1940, 1, 1)
-ARCHIVE_MAX_DATE = date.today()
+ARCHIVE_MAX_DATE = date.today() - timedelta(days=1)
 
 # IEM/ASOS reports visibility in statute miles. 1 statute mile = 1.609344 km.
 MILES_TO_KM = 1.609344
@@ -210,21 +224,63 @@ def _request_text(url, params):
 # OPEN-METEO HISTORICAL ARCHIVE
 # ==========================================
 
-def fetch_archive_weather(airport_code, info, start_date, end_date):
-    """Fetch hourly reanalysis weather for one airport/date range.
+def _coerce_date(value):
+    """Normalise a date/datetime/ISO string to ``datetime.date``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
 
-    Timezone is requested explicitly (the airport's IANA zone), so returned
-    timestamps are in the airport's local time - matching the local
-    (timezone-naive) ``scheduled_departure`` stored on fact_flight.
+
+def _padded_request_dates(start_date, end_date):
+    """Return an API request window padded by one day on each side.
+
+    Open-Meteo resolves the ``timezone`` offset once at request time. With
+    ``timeformat=unixtime`` a London request made while the request-time
+    offset is GMT returns UTC-day boundaries even for a summer date. Padding
+    guarantees the logical local days are present regardless of that offset;
+    ``fetch_archive_weather`` then filters to the logical dates.
     """
+    logical_start = _coerce_date(start_date)
+    logical_end = _coerce_date(end_date)
+    request_start = max(
+        logical_start - timedelta(days=1), ARCHIVE_MIN_DATE
+    )
+    request_end = min(
+        logical_end + timedelta(days=1), date.today()
+    )
+    return request_start, request_end
+
+
+def fetch_archive_weather(airport_code, info, start_date, end_date):
+    """Fetch hourly reanalysis weather as true UTC instants.
+
+    Open-Meteo's ``timezone`` parameter resolves one fixed offset at request
+    time and does not apply DST transitions inside the requested range. It is
+    therefore unsafe for historical storage. ``timeformat=unixtime`` returns
+    absolute UTC instants; the airport's IANA zone is used only for display
+    and local-hour association.
+
+    The request is padded by one day on each side and the returned frame is
+    filtered back to the logical local dates. This avoids request-time-offset
+    boundary loss without shifting or fabricating timestamps.
+    """
+
+    logical_start = _coerce_date(start_date)
+    logical_end = _coerce_date(end_date)
+    request_start, request_end = _padded_request_dates(
+        logical_start, logical_end
+    )
 
     params = {
         "latitude": info["lat"],
         "longitude": info["lon"],
-        "start_date": start_date,
-        "end_date": end_date,
+        "start_date": request_start.strftime("%Y-%m-%d"),
+        "end_date": request_end.strftime("%Y-%m-%d"),
         "hourly": ",".join(HOURLY_VARIABLES),
         "timezone": info["tz"],
+        "timeformat": "unixtime",
     }
 
     payload = _request_json(ARCHIVE_URL, params)
@@ -236,11 +292,24 @@ def fetch_archive_weather(airport_code, info, start_date, end_date):
             f"archive response for {airport_code} missing hourly data"
         )
 
-    frame = pd.DataFrame(
-        {
-            "time": pd.to_datetime(hourly["time"], errors="coerce"),
-        }
+    times_utc = pd.Series(
+        pd.to_datetime(
+            hourly["time"], unit="s", utc=True, errors="coerce"
+        )
     )
+    if times_utc.isna().any():
+        raise RuntimeError(
+            f"archive response for {airport_code} has invalid epoch times"
+        )
+    if times_utc.duplicated().any():
+        raise RuntimeError(
+            f"archive response for {airport_code} has duplicate timestamps"
+        )
+
+    frame = pd.DataFrame({"time_utc": times_utc})
+    frame["time_local"] = times_utc.dt.tz_convert(
+        utc_zone(info["tz"])
+    ).dt.tz_localize(None)
 
     for variable in HOURLY_VARIABLES:
         values = hourly.get(variable)
@@ -248,16 +317,29 @@ def fetch_archive_weather(airport_code, info, start_date, end_date):
             # Missing variable -> genuinely unavailable, kept as NULL.
             frame[variable] = pd.NA
         else:
+            if len(values) != len(frame):
+                raise RuntimeError(
+                    f"archive response for {airport_code} has mismatched "
+                    f"length for {variable}"
+                )
             frame[variable] = pd.to_numeric(
                 pd.Series(values), errors="coerce"
             )
 
-    frame = frame.dropna(subset=["time"]).reset_index(drop=True)
+    frame = frame.reset_index(drop=True)
+    frame = frame[
+        (frame["time_local"].dt.date >= logical_start)
+        & (frame["time_local"].dt.date <= logical_end)
+    ].reset_index(drop=True)
 
+    frame.attrs["time_basis"] = "UTC"
     frame.attrs["resolved_timezone"] = payload.get("timezone")
-    frame.attrs["resolved_utc_offset"] = payload.get(
+    frame.attrs["api_response_utc_offset_seconds"] = payload.get(
         "utc_offset_seconds"
     )
+    # Drop the timezone only after filtering so resulting rows are positionally
+    # aligned with the retained local dates (never index-aligned to raw input).
+    frame["time_utc"] = frame["time_utc"].dt.tz_localize(None)
 
     return frame
 
@@ -267,18 +349,21 @@ def fetch_archive_weather(airport_code, info, start_date, end_date):
 # ==========================================
 
 def fetch_iem_visibility(icao, timezone_name, start_date, end_date):
-    """Fetch observed METAR visibility (converted to km) for one station.
+    """Fetch observed METAR visibility (converted to km) as UTC instants.
 
-    Source: Iowa Environmental Mesonet ASOS archive (NOAA ISD). Returns an
-    empty frame when the station/period has no observations; missing values
-    are never fabricated. Visibility is reported in statute miles and
-    converted to kilometres; values may be capped near 10 km by the
-    reporting standard.
+    Source: Iowa Environmental Mesonet ASOS archive (NOAA ISD). IEM is asked
+    for ``tz=UTC`` so its DST-aware local labels can never be mixed with the
+    archive's fixed-offset labels. Returns an empty frame when the
+    station/period has no observations; missing values are never fabricated.
+    Visibility is reported in statute miles and converted to kilometres;
+    values may be capped near 10 km by the reporting standard.
     """
 
     start = datetime.fromisoformat(start_date)
     end = datetime.fromisoformat(end_date)
 
+    # ``timezone_name`` is retained for signature compatibility. IEM is always
+    # queried in UTC; local association happens after parsing.
     params = {
         "station": icao,
         "data": "vsby",
@@ -288,7 +373,7 @@ def fetch_iem_visibility(icao, timezone_name, start_date, end_date):
         "year2": end.year,
         "month2": end.month,
         "day2": end.day,
-        "tz": timezone_name,
+        "tz": "UTC",
         "format": "onlycomma",
         "latlon": "no",
         "missing": "M",
@@ -300,7 +385,7 @@ def fetch_iem_visibility(icao, timezone_name, start_date, end_date):
     body = _request_text(IEM_ASOS_URL, params)
 
     if not body.strip():
-        return pd.DataFrame(columns=["time", "visibility_km"])
+        return pd.DataFrame(columns=["time_utc", "visibility_km"])
 
     from io import StringIO
 
@@ -308,48 +393,110 @@ def fetch_iem_visibility(icao, timezone_name, start_date, end_date):
     raw.columns = [c.strip() for c in raw.columns]
 
     if "valid" not in raw.columns or "vsby" not in raw.columns:
-        return pd.DataFrame(columns=["time", "visibility_km"])
+        return pd.DataFrame(columns=["time_utc", "visibility_km"])
 
     frame = pd.DataFrame(
         {
-            "time": pd.to_datetime(raw["valid"], errors="coerce"),
+            "time_utc": pd.to_datetime(
+                raw["valid"], utc=True, errors="coerce"
+            ),
             "vsby": pd.to_numeric(raw["vsby"], errors="coerce"),
         }
     )
 
-    frame = frame.dropna(subset=["time", "vsby"])
+    frame = frame.dropna(subset=["time_utc", "vsby"])
     frame["visibility_km"] = (
         frame["vsby"] * MILES_TO_KM
     ).clip(upper=IEM_VISIBILITY_CAP_KM)
 
-    return frame[["time", "visibility_km"]]
+    result = frame[["time_utc", "visibility_km"]].reset_index(drop=True)
+    result.attrs["time_basis"] = "UTC"
+    return result
 
 
 # ==========================================
 # NORMALISATION + MATCHING
 # ==========================================
 
-def _floor_to_hour(series):
-    return pd.to_datetime(series, errors="coerce").dt.floor("h")
+def _require_utc_series(frame, label):
+    """Return an aware UTC series or fail rather than assume a time basis."""
+
+    if "time_utc" in frame.columns:
+        values = pd.to_datetime(frame["time_utc"], utc=True, errors="coerce")
+    elif frame.attrs.get("time_basis") == "UTC" and "time" in frame.columns:
+        values = pd.to_datetime(frame["time"], utc=True, errors="coerce")
+    else:
+        raise ValueError(
+            f"{label} timestamps have no explicit UTC basis"
+        )
+    if values.isna().any():
+        raise ValueError(f"{label} contains invalid timestamps")
+    return values.dt.tz_convert("UTC").reset_index(drop=True)
 
 
-def build_weather_rows(airport_code, archive_frame, visibility_frame):
-    """Combine archive reanalysis with observed visibility into rows."""
+def _local_hour_keys(utc_series, timezone_name):
+    """Return local-hour/offset keys that keep repeated DST hours apart."""
 
-    frame = archive_frame.copy()
-    frame["observation_time"] = _floor_to_hour(frame["time"])
+    local = utc_series.dt.tz_convert(utc_zone(timezone_name))
+    offsets = local.map(
+        lambda value: int(value.utcoffset().total_seconds())
+    )
+    return pd.DataFrame(
+        {
+            "local_hour": local.dt.tz_localize(None).dt.floor("h"),
+            "utc_offset_seconds": offsets,
+        }
+    )
 
-    # One visibility value per local hour (most restrictive observation in
-    # that hour), so a low-visibility report is never averaged away.
+
+def build_weather_rows(airport_code, archive_frame, visibility_frame,
+                       timezone_name=None):
+    """Combine UTC archive reanalysis with UTC visibility into UTC rows."""
+
+    tz_name = (
+        timezone_name
+        or archive_frame.attrs.get("resolved_timezone")
+        or AIRPORT_INFO.get(airport_code, {}).get("tz")
+    )
+    if not tz_name:
+        raise ValueError(f"no IANA timezone for {airport_code}")
+
+    archive_utc = _require_utc_series(archive_frame, "archive")
+    if archive_utc.duplicated().any():
+        raise ValueError("archive contains duplicate UTC timestamps")
+
+    frame = archive_frame.copy().reset_index(drop=True)
+    frame["observation_time"] = archive_utc.dt.tz_localize(None)
+    frame = pd.concat(
+        [frame, _local_hour_keys(archive_utc, tz_name)], axis=1
+    )
+
+    # Visibility is assigned to the same local hour and UTC offset, so the
+    # two repeated fall-back hours cannot collapse into one bucket. The most
+    # restrictive report in that bucket is kept.
     if visibility_frame is not None and not visibility_frame.empty:
-        vis = visibility_frame.copy()
-        vis["observation_time"] = _floor_to_hour(vis["time"])
+        vis_utc = _require_utc_series(visibility_frame, "visibility")
+        vis = pd.DataFrame(
+            {
+                "visibility_km": visibility_frame[
+                    "visibility_km"
+                ].reset_index(drop=True),
+            }
+        )
+        vis = pd.concat(
+            [vis, _local_hour_keys(vis_utc, tz_name).reset_index(drop=True)],
+            axis=1,
+        )
         vis = (
-            vis.groupby("observation_time")["visibility_km"]
+            vis.groupby(["local_hour", "utc_offset_seconds"])[
+                "visibility_km"
+            ]
             .min()
             .reset_index()
         )
-        frame = frame.merge(vis, on="observation_time", how="left")
+        frame = frame.merge(
+            vis, on=["local_hour", "utc_offset_seconds"], how="left"
+        )
         frame["visibility_source"] = frame["visibility_km"].apply(
             lambda value: IEM_SOURCE_DATASET if pd.notna(value) else None
         )
@@ -374,60 +521,67 @@ def build_weather_rows(airport_code, archive_frame, visibility_frame):
             ),
             "visibility_source": frame["visibility_source"],
             "source_dataset": ARCHIVE_SOURCE_DATASET,
-            "source_model": ARCHIVE_SOURCE_MODEL,
+            "source_model": ARCHIVE_UTC_SOURCE_MODEL,
         }
     )
 
-    rows.attrs["resolved_timezone"] = archive_frame.attrs.get(
-        "resolved_timezone"
-    )
+    rows.attrs["time_basis"] = "UTC"
+    rows.attrs["resolved_timezone"] = tz_name
+    rows.attrs["resolved_utc_offset"] = None
 
     return rows
 
 
-def match_flights_to_weather(flights_frame, weather_index, tolerance_minutes=60):
-    """Deterministic flight -> weather matching.
+def match_flights_to_weather(flights_frame, weather_index,
+                             source_semantics=None):
+    """Return exact UTC-hour matches only; never use a nearest hour.
 
-    A flight matches the weather observation for its origin airport at the
-    hour of its (local, timezone-naive) ``scheduled_departure``. If that hour
-    is absent, the nearest observation within +/- tolerance is used, with a
-    preference for the earlier observation. No match is returned when
-    nothing is available.
+    A flight is convertible only when its source semantics are explicitly
+    declared as ``origin_local`` or ``utc``. Ambiguous/nonexistent local
+    hours, unresolved sources and missing exact hours all yield ``None``.
     """
 
-    tolerance = timedelta(minutes=tolerance_minutes)
+    semantics_map = source_semantics or FLIGHT_TIMESTAMP_SEMANTICS
     results = []
 
     for row in flights_frame.itertuples(index=False):
-
         target = row.scheduled_departure
-        key = (row.airport_code, target)
-
-        if pd.isna(target) or row.airport_code not in weather_index:
+        airport_code = row.airport_code
+        if pd.isna(target) or airport_code not in weather_index:
             results.append(None)
             continue
 
-        observations = weather_index[row.airport_code]
-        floored = target.floor("h")
-
-        if floored in observations:
-            results.append(observations[floored])
-            continue
-
-        candidates = [
-            hour
-            for hour in observations
-            if abs(hour - floored) <= tolerance
-        ]
-
-        if not candidates:
+        source = str(
+            getattr(row, "source_system", "") or ""
+        ).strip().lower()
+        semantics = semantics_map.get(source, "unresolved")
+        tz_name = AIRPORT_INFO.get(airport_code, {}).get("tz")
+        if tz_name is None or semantics not in ("origin_local", "utc"):
             results.append(None)
             continue
 
-        chosen = sorted(
-            candidates, key=lambda hour: (abs(hour - floored), hour)
-        )[0]
-        results.append(observations[chosen])
+        try:
+            target_utc = flight_utc_hour(
+                target.to_pydatetime()
+                if isinstance(target, pd.Timestamp) else target,
+                tz_name,
+                semantics,
+            )
+        except (
+            AmbiguousLocalTime,
+            NonexistentLocalTime,
+            InvalidTimestamp,
+            ValueError,
+        ):
+            results.append(None)
+            continue
+
+        if target_utc is None:
+            results.append(None)
+            continue
+
+        key = target_utc.replace(tzinfo=None)
+        results.append(weather_index[airport_code].get(key))
 
     return results
 
@@ -664,13 +818,43 @@ def _upsert_weather(conn, rows):
 # WEATHER ETL
 # ==========================================
 
-def run_weather_etl(dry_run=False, airport_filter=None):
+def _coerce_override_date(value):
+    """Convert a date/datetime/ISO string override to ``datetime.date``."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.fromisoformat(str(value)).date()
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"invalid start-date override: {value!r}"
+        ) from error
+
+
+def run_weather_etl(dry_run=False, airport_filter=None,
+                    start_date_override=None, start_date_overrides=None):
     """Historical weather ETL.
 
     ``dry_run=True`` performs every step except database writes, allowing
     API + matching validation without mutating the warehouse. This function
     never assigns weather keys to fact_flight - that is a separate, gated
     operation.
+
+    ``start_date_override`` (data-refresh policy, P2): a ``datetime.date``
+    that raises every airport's fetch start to at least that day. Kept for
+    callers that need one shared lower bound.
+
+    ``start_date_overrides`` (P2, per-airport): a mapping of
+    ``airport_code -> date`` that raises that airport's fetch start to at
+    least its own day (``refresh_orchestrator`` derives it from each
+    airport's watermark minus the configured overlap). Airports absent from
+    the mapping keep their full available history, so a first run or a
+    newly-added airport is never partially covered. Both arguments default
+    to ``None``, preserving the original full-range behaviour exactly.
     """
 
     print("\n" + "=" * 70)
@@ -679,6 +863,34 @@ def run_weather_etl(dry_run=False, airport_filter=None):
 
     if dry_run:
         print(" [dry-run] No database writes will be performed.")
+
+    if start_date_overrides is not None and not isinstance(
+        start_date_overrides, dict
+    ):
+        raise TypeError(
+            "start_date_overrides must be a mapping of airport_code -> date"
+        )
+
+    per_airport_overrides = None
+    if start_date_overrides is not None:
+        per_airport_overrides = {
+            code: _coerce_override_date(value)
+            for code, value in start_date_overrides.items()
+        }
+
+    shared_override = _coerce_override_date(start_date_override)
+
+    if per_airport_overrides:
+        print(
+            " Incremental windows: each airport starts at its own "
+            "watermark - overlap; airports without a watermark fetch "
+            "their full history"
+        )
+    elif shared_override is not None:
+        print(
+            f" Incremental window: fetching from {shared_override} "
+            "(watermark - overlap), never earlier than each airport's span"
+        )
 
     flights = _read_flights()
     airport_keys = _read_airport_keys()
@@ -708,6 +920,16 @@ def run_weather_etl(dry_run=False, airport_filter=None):
     total_rows = 0
     rows_with_visibility = 0
 
+    print(
+        " Flight timestamp semantics (matching report only): "
+        + ", ".join(
+            f"{source}={semantics}"
+            for source, semantics in sorted(
+                FLIGHT_TIMESTAMP_SEMANTICS.items()
+            )
+        )
+    )
+
     print("\n2. Fetching historical weather per origin airport...")
 
     for airport_code, span in airports.iterrows():
@@ -726,7 +948,14 @@ def run_weather_etl(dry_run=False, airport_filter=None):
 
         start_date = max(
             span["min"].date(), ARCHIVE_MIN_DATE
-        ).strftime("%Y-%m-%d")
+        )
+        if shared_override is not None:
+            start_date = max(start_date, shared_override)
+        if per_airport_overrides:
+            airport_override = per_airport_overrides.get(airport_code)
+            if airport_override is not None:
+                start_date = max(start_date, airport_override)
+        start_date = start_date.strftime("%Y-%m-%d")
         end_date = min(
             span["max"].date(), ARCHIVE_MAX_DATE
         ).strftime("%Y-%m-%d")
@@ -753,13 +982,17 @@ def run_weather_etl(dry_run=False, airport_filter=None):
                 info["icao"], info["tz"], start_date, end_date
             )
         except RuntimeError as error:
-            visibility = pd.DataFrame(columns=["time", "visibility_km"])
+            visibility = pd.DataFrame(
+                columns=["time_utc", "visibility_km"]
+            )
             print(
                 f"    {airport_code}: visibility source unavailable "
                 f"({error}) - visibility will be NULL"
             )
 
-        built = build_weather_rows(airport_code, archive, visibility)
+        built = build_weather_rows(
+            airport_code, archive, visibility, timezone_name=info["tz"]
+        )
         built["airport_key"] = airport_keys[airport_code]
         built["source_timezone"] = info["tz"]
 
@@ -768,7 +1001,8 @@ def run_weather_etl(dry_run=False, airport_filter=None):
         rows_with_visibility += int(built["visibility"].notna().sum())
 
         hours = {
-            hour: hour for hour in built["observation_time"].dropna()
+            hour.to_pydatetime(): hour.to_pydatetime()
+            for hour in built["observation_time"].dropna()
         }
         matched_hours[airport_code] = hours
 
@@ -781,7 +1015,7 @@ def run_weather_etl(dry_run=False, airport_filter=None):
     # -------- matching report (no writes) --------
 
     flights["weather_observation_time"] = match_flights_to_weather(
-        flights, matched_hours
+        flights, matched_hours, source_semantics=FLIGHT_TIMESTAMP_SEMANTICS
     )
     matched = int(flights["weather_observation_time"].notna().sum())
     unmatched = int(len(flights) - matched)
@@ -818,7 +1052,11 @@ def run_weather_etl(dry_run=False, airport_filter=None):
     print(f"  flights considered     : {len(flights)}")
     print(f"  flights matched        : {matched}")
     print(f"  flights unmatched      : {unmatched}")
-    print(f"  fact weather_key writes: 0 (disabled this phase)")
+    print("  fact weather_key writes: 0 (disabled this phase)")
+    print(
+        "  storage basis          : UTC "
+        f"({ARCHIVE_UTC_SOURCE_MODEL}); local display uses source_timezone"
+    )
     print("-" * 70)
 
     if len(weather_records) == 0 and (skipped or fetch_failures):
@@ -831,7 +1069,17 @@ def run_weather_etl(dry_run=False, airport_filter=None):
     print(" WEATHER ETL COMPLETED SUCCESSFULLY")
     print("=" * 70 + "\n")
 
-    return True
+    return {
+        "airports_processed": len(weather_records),
+        "airports_skipped": list(skipped),
+        "airports_failed": list(fetch_failures),
+        "rows_built": total_rows,
+        "rows_with_visibility": rows_with_visibility,
+        "rows_written": written,
+        "flights_considered": len(flights),
+        "flights_matched": matched,
+        "flights_unmatched": unmatched,
+    }
 
 
 if __name__ == "__main__":
