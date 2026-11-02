@@ -221,6 +221,23 @@ ties at the boundary (see "Query-result baseline re-recording" in
 `docs/BASELINE_MANIFEST.md`). Confirm by comparing the full grouped
 aggregates before concluding anything changed.
 
+## Synthetic CSV passenger backfill (one-time, approved)
+
+`data/flight.csv` now contains a synthetic `passenger_count` column and
+`etl.py` maps it for future inserts. Because the normal CSV stage is
+insert-only, existing rows require the approved bounded backfill:
+
+```bash
+venv/bin/python scripts/backfill_csv_passengers.py           # dry run
+venv/bin/python scripts/backfill_csv_passengers.py --execute # lock + audit + verify
+```
+
+The execute path updates only `fact_flight.passenger_count` for
+`source_system='csv'`, verifies before commit, and rolls back on failure.
+It does not advance watermarks and is not part of `refresh_orchestrator.py`.
+See `docs/SYNTHETIC_PASSENGER_DATA.md` for the generation configuration,
+labeling requirement, validation results, and rollback SQL.
+
 ## Bounded OLTP change updater (standalone CLI)
 
 ```bash

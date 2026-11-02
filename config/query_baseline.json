@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-20T22:52:20",
+  "generated_at": "2026-11-02T20:14:16",
   "queries": {
     "members/Kavindu.py:QUERY_ARRIVALS_VS_DEPARTURES": {
       "file": "members/Kavindu.py",
@@ -47,25 +47,25 @@
     },
     "members/gihan.py:QUERY_PASSENGERS_BY_AIRLINE": {
       "file": "members/gihan.py",
-      "result_sha256": "c92c0b63d0cefe8fd22d5ae94fc8e86f6aca836be695a22e93eade3e05ba018e",
+      "result_sha256": "a524f97e4a23973c2264c90c23478df59982eb42fc9a352de79d3f1d6927ec29",
       "rows": 9,
       "sql_sha256": "72a54ddf66dd9aa9b489521cd456fa996660576c3a805937c2eb36e70562821d"
     },
     "members/gihan.py:QUERY_PASSENGERS_VS_DELAY": {
       "file": "members/gihan.py",
-      "result_sha256": "bf10d90e9f59f77fb06d6cba0ee5d56f908ff801ad19148704cffbd5bc212dba",
-      "rows": 3,
+      "result_sha256": "2216c46c93a8e43c36bf7a560e5804a20c63ac52503d98d96c6900cc2df0de0f",
+      "rows": 26,
       "sql_sha256": "4e72cc3a2ba03b0d12920b56e192cc7dd81e1e0f0752ad06cd2b92fcccf4b0ff"
     },
     "members/gihan.py:QUERY_TOP_ROUTES_PASSENGERS": {
       "file": "members/gihan.py",
-      "result_sha256": "e36e3b723e1083ff3fd5aa1b63d6f803a2be6cfecd14469a7052cede31a6cb57",
+      "result_sha256": "15f1e1beadadf7199ee1662416a61d8b60d662ce230b1ad3f058d15fad7dde5d",
       "rows": 10,
       "sql_sha256": "acc3af9bdc962a0038e2947077266103ba4f9c907f87cef25130fe4471957f11"
     },
     "members/hasala.py:QUERY_AIRLINE_METRICS": {
       "file": "members/hasala.py",
-      "result_sha256": "036e3274974d662bf63c126facfde403406b4440830ea19ae1d9d00449d9f61e",
+      "result_sha256": "4a8f2d699277b017824e4a4c65d33cb3ba702d6304140be61d15bf9c2ed7b6d6",
       "rows": 9,
       "sql_sha256": "1dc86472d23f4a22e90d9759087cc76bd26bfd2539490497b6cc0839c38de5a7"
     },
@@ -89,7 +89,7 @@
     },
     "members/hasala.py:QUERY_FLIGHTS_VS_PASSENGERS": {
       "file": "members/hasala.py",
-      "result_sha256": "de2dcd61a85f6a0c9fb1cc1049e85c390a1ae5870ba53ad4d1812c1b3c276775",
+      "result_sha256": "e3f2c391e4abc7270325567bbcf97800ed49b4b24d344ee92bac35a43816f75b",
       "rows": 9,
       "sql_sha256": "5608d80aa0d928d3778604aab9f1f6fbcdeb94b863e6eabd131fc37d0ee26852"
     },

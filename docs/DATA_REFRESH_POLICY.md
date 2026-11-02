@@ -45,6 +45,13 @@ approach was chosen, and the guarantees every refresh must uphold.
 | Weather archive | Full range on first run, then **incremental window** (enabled; opt-out) | Yes | 86k+ observations; incremental needs overlap to catch late corrections. Design below. |
 | OLTP (Aiven `flights`) | **Full refresh, insert-only** | No | Incremental was evaluated and **rejected with evidence** (below). |
 
+CSV `passenger_count` is synthetic enplaned-passenger data generated from the
+approved seed and route-band assumptions. The 500 existing CSV rows were
+migrated by a one-time bounded backfill
+(`scripts/backfill_csv_passengers.py`); normal CSV refresh remains
+insert-only. See `docs/SYNTHETIC_PASSENGER_DATA.md`. This backfill exception
+does not authorize updates/deletes in the normal refresh path.
+
 ### OLTP incremental: rejected with evidence
 
 Measured on the live source (recorded in `docs/BASELINE_MANIFEST.md`):
