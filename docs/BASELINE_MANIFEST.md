@@ -30,14 +30,14 @@ each file, captured **before any change** and re-verified afterwards:
 
 | File | SHA-256 |
 |---|---|
-| `etl.py` | `bd661d805996205a22a9521f437225816891f3c7798cbcd45d383c3fd78d4e15` |
+| `etl.py` | `ccea9a4bf79ac4cb8f1461951a259fcfea94900b64a0c769512b38cebbdf0ff9`* |
 | `weather_etl.py` | `04b8becb5f7741587fc3577ea49ba037d809ff72a2f9bbdb7f799a353aa72dc3`* |
 | `oltp_etl.py` | `61ba95c058a9af8ae0543656a891bc6b74bb8e4ca58012aab51f785b436a9bed` |
 | `main_etl.py` | `9fa85f43ac25bc42e50f509319945b1b3099823785623dfaa4c9b35cfc6691cc` |
 | `setup_database.py` | `b1f89b6dcf04adf5d0cd16d6f1eda775836a8a8fd681f6dada987139ddbab05c` |
 | `database.py` | `38023436e009b394d2b2847d5c409a2d3f910c31c82328fc99b84d032a455a5c` |
 | `sql/schema.sql` | `00d518d875ed0db094d702bba7af1435fcc4b24ead435344cec34772744181b8` |
-| `data/flight.csv` | `5838f3fee71d7adb43b815d50516561680491c8a0a9cebd9d316994279e9cdf1` |
+| `data/flight.csv` | `a67082ed97af53567dfb16fa4382b5585a91079fa9ec1b7959d8410dfefcd391`* |
 | `requirements.txt` | `dbcffa093707d91ee50c23c43ed1e90c8c6d160ba21fa901e6bfb86548bc44d9` |
 | `.gitignore` | `3a2fd2a67ee4ba95d67d7cc689e6effe5b26b0f1e5bd11cd77412ef0c1b5ebf9`* |
 
@@ -57,6 +57,18 @@ not shift timestamps, persist padded rows, or alter default outputs when
 the provider returns complete days. Every other file above must match
 exactly.
 
+\* `etl.py` and `data/flight.csv` were approved for the synthetic enplaned
+passenger-count feature on 2026-11-02. `data/flight.csv` gained only the
+appended `passenger_count` column; all existing columns, row order, and
+flight IDs are unchanged. `etl.py` gained only the CSV passenger mapping
+and its fail-closed validation, with all other ETL behaviour unchanged.
+Previous hashes: `etl.py`
+`bd661d805996205a22a9521f437225816891f3c7798cbcd45d383c3fd78d4e15`;
+`data/flight.csv`
+`5838f3fee71d7adb43b815d50516561680491c8a0a9cebd9d316994279e9cdf1`.
+The generated values are synthetic and are documented in
+`docs/SYNTHETIC_PASSENGER_DATA.md`.
+
 ## Query result baseline
 
 `config/query_baseline.json` — produced by
@@ -70,6 +82,15 @@ venv/bin/python scripts/query_checksum.py --compare config/query_baseline.json
 
 A mismatch means an analytical result changed — an automatic fail of the
 overall task.
+
+Exception approved on 2026-11-02: after the synthetic passenger backfill,
+only these five result entries were re-recorded, with all 25 SQL-text
+hashes unchanged: `members/hasala.py:QUERY_AIRLINE_METRICS`,
+`members/hasala.py:QUERY_FLIGHTS_VS_PASSENGERS`,
+`members/gihan.py:QUERY_PASSENGERS_BY_AIRLINE`,
+`members/gihan.py:QUERY_TOP_ROUTES_PASSENGERS`, and
+`members/gihan.py:QUERY_PASSENGERS_VS_DELAY`. The documented tie-sensitive
+Kavindu baseline note is preserved unchanged.
 
 ## Warehouse (live MySQL, `aviation_dw`) at capture
 

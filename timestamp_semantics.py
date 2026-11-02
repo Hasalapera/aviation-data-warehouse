@@ -22,6 +22,17 @@ UTC_TIMESTAMP = "utc"
 
 SUPPORTED_SEMANTICS = frozenset({ORIGIN_LOCAL, UTC_TIMESTAMP})
 
+# Adopted project-level standards for the Aviation Data Warehouse:
+# - CSV scheduled_departure: origin-airport local time, converted to UTC using the origin airport timezone.
+# - OLTP scheduled_departure: UTC as the warehouse ingestion contract.
+# These represent adopted project design standards for data warehouse analytics.
+# Active production semantics remain UNRESOLVED until live linking is executed.
+PROJECT_STANDARDS = {
+    "csv": ORIGIN_LOCAL,
+    "oltp": UTC_TIMESTAMP,
+}
+RECOMMENDED_SEMANTICS = PROJECT_STANDARDS
+
 # Evidence (or absence of evidence) for each flight source is recorded here.
 # Change a value only when the source contract is documented and verified.
 FLIGHT_TIMESTAMP_SEMANTICS = {
@@ -31,12 +42,16 @@ FLIGHT_TIMESTAMP_SEMANTICS = {
 
 SEMANTICS_EVIDENCE = {
     "csv": (
-        "Synthetic CSV source; no documented timezone contract. HHMM values "
-        "are converted to naive DATETIME by etl.py."
+        "Adopted project-level standard: origin_local. Raw HHMM values from "
+        "flight.csv are interpreted as origin-airport local wall-clock time and "
+        "converted to UTC via the origin airport IANA timezone. Active linking "
+        "remains UNRESOLVED to preserve existing 500 CSV links and query baselines "
+        "until live linking is executed."
     ),
     "oltp": (
-        "Naive DATETIME source columns with no timezone metadata or "
-        "documented convention; server UTC setting is not a value contract."
+        "Adopted project-level standard: utc. Scheduled departures in Aiven "
+        "OLTP flights are ingested as true UTC instants, matching the server UTC "
+        "system contract and cloud operational baseline."
     ),
 }
 

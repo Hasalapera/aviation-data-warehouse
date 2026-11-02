@@ -419,6 +419,39 @@ class TestLinkerTimestampSafety(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             weather_linker.apply_links(plan, engine=object(), dry_run=True)
 
+    def test_recommended_semantics_standards_defined_but_unresolved_by_default(self):
+        from timestamp_semantics import (
+            FLIGHT_TIMESTAMP_SEMANTICS,
+            RECOMMENDED_SEMANTICS,
+            PROJECT_STANDARDS,
+            ORIGIN_LOCAL,
+            UTC_TIMESTAMP,
+            UNRESOLVED,
+        )
+
+        self.assertEqual(RECOMMENDED_SEMANTICS["csv"], ORIGIN_LOCAL)
+        self.assertEqual(RECOMMENDED_SEMANTICS["oltp"], UTC_TIMESTAMP)
+        self.assertEqual(PROJECT_STANDARDS, RECOMMENDED_SEMANTICS)
+        self.assertEqual(FLIGHT_TIMESTAMP_SEMANTICS["csv"], UNRESOLVED)
+        self.assertEqual(FLIGHT_TIMESTAMP_SEMANTICS["oltp"], UNRESOLVED)
+    def test_linker_cli_proposed_standards_dry_run_and_refuses_execute(self):
+        import io
+        import contextlib
+
+        out = io.StringIO()
+        mock_engine = mock.MagicMock()
+        mock_engine.connect.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = []
+        mock_engine.url.database = "test_dw"
+        with contextlib.redirect_stdout(out):
+            code = weather_linker.main(["--dry-run", "--proposed-standards"], target_engine=mock_engine)
+        self.assertEqual(code, 0)
+        self.assertIn("DRY RUN only", out.getvalue())
+
+        err_out = io.StringIO()
+        with contextlib.redirect_stdout(err_out):
+            code = weather_linker.main(["--execute", "--proposed-standards"])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be executed against production", err_out.getvalue())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -221,6 +221,23 @@ ties at the boundary (see "Query-result baseline re-recording" in
 `docs/BASELINE_MANIFEST.md`). Confirm by comparing the full grouped
 aggregates before concluding anything changed.
 
+## Synthetic CSV passenger backfill (one-time, approved)
+
+`data/flight.csv` now contains a synthetic `passenger_count` column and
+`etl.py` maps it for future inserts. Because the normal CSV stage is
+insert-only, existing rows require the approved bounded backfill:
+
+```bash
+venv/bin/python scripts/backfill_csv_passengers.py           # dry run
+venv/bin/python scripts/backfill_csv_passengers.py --execute # lock + audit + verify
+```
+
+The execute path updates only `fact_flight.passenger_count` for
+`source_system='csv'`, verifies before commit, and rolls back on failure.
+It does not advance watermarks and is not part of `refresh_orchestrator.py`.
+See `docs/SYNTHETIC_PASSENGER_DATA.md` for the generation configuration,
+labeling requirement, validation results, and rollback SQL.
+
 ## Bounded OLTP change updater (standalone CLI)
 
 ```bash
@@ -391,9 +408,16 @@ own `logs/` directory is not pruned.
   offset, so repeated fall-back hours remain distinct.
 - Legacy `best_match` rows are left untouched and are never linker
   candidates. They retain their old fixed-offset labels.
-- CSV and OLTP flight timestamp semantics are explicitly `unresolved` until a
-  source contract is documented and verified. The linker therefore makes no
-  proposals and updates no `weather_key` values by default.
+- Recommended operational standards for the warehouse:
+  - CSV `scheduled_departure`: origin-airport local time, converted to UTC using the origin airport timezone.
+  - OLTP `scheduled_departure`: UTC as the target application/database contract.
+  - Power BI: weather consumed through `fact_flight.weather_key`; new UTC weather rows must be compatible.
+  These represent proposed standards, NOT confirmed facts about existing production source data.
+  Active production semantics remain explicitly `unresolved` until authoritative owners confirm them.
+  The linker therefore makes no proposals and updates no `weather_key` values by default.
+  Operators can preview link proposals under the recommended standards using:
+  `venv/bin/python weather_linker.py --dry-run --proposed-standards`
+  (Execution via `--execute` is strictly refused until confirmed).
 - DST gaps and repeated local hours are held; no nearest-hour matching is
   used.
 - Before the first UTC ingest, reconcile the weather watermark. Existing
