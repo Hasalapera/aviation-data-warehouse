@@ -3,9 +3,9 @@
   "comment": "Data Refresh Policy configuration. All stages enabled+required; weather chunk size 1000 (=weather_etl.INSERT_CHUNK_SIZE); incremental weather ON after safety validation (set weather_incremental.enabled=false to restore full-range fetching).",
   "order": ["csv", "weather", "oltp"],
   "sources": {
-    "csv":    { "enabled": true, "required": true },
-    "weather":{ "enabled": true, "required": true },
-    "oltp":   { "enabled": true, "required": true }
+    "csv":    { "enabled": true, "required": true, "incremental": false },
+    "weather":{ "enabled": true, "required": true, "incremental": true },
+    "oltp":   { "enabled": true, "required": true, "incremental": false }
   },
   "failure_policy": "continue-on-stage-failure (same as main_etl.py): remaining stages still run; exit code is non-zero if any REQUIRED stage did not finish SUCCESS.",
   "lock_timeout_seconds": 0,

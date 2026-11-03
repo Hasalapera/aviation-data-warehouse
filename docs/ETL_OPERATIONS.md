@@ -23,6 +23,7 @@ venv/bin/python refresh_orchestrator.py --source weather
 venv/bin/python refresh_orchestrator.py --no-verify     # skip post-load checks (weather watermarks will NOT advance)
 venv/bin/python refresh_orchestrator.py --verify-only   # read-only checks only (never creates audit tables)
 venv/bin/python refresh_orchestrator.py --enable-changes # opt-in OLTP updates
+venv/bin/python refresh_orchestrator.py --compare-incremental # read-only comparison vs full recomputation
 venv/bin/python refresh_orchestrator.py --config path/to/policy.json
 ```
 
@@ -72,8 +73,17 @@ Incremental weather is controlled **only** by
 `config/refresh_policy.json`:
 
 ```json
+"sources": {
+  "csv":    { "enabled": true, "required": true, "incremental": false },
+  "weather":{ "enabled": true, "required": true, "incremental": true },
+  "oltp":   { "enabled": true, "required": true, "incremental": false }
+},
 "weather_incremental": { "enabled": true, "overlap_days": 7 }
 ```
+
+- Per-source settings: `csv` and `oltp` must remain `incremental: false`
+  (configuring `true` fails preflight validation with exit `2` because those
+  sources lack reliable change-capture timestamps).
 
 - `enabled: true` (shipped) makes each airport fetch from
   `its own watermark date - overlap_days`, clamped to its first flight.

@@ -62,8 +62,9 @@ REQUEST_RETRIES = 3
 INSERT_CHUNK_SIZE = 1000
 
 # Open-Meteo historical archive coverage bounds. Requests outside this
-# window return HTTP 400, so flight date ranges are clamped to it. Future
-# flights simply have no observation available and remain unmatched.
+# window return HTTP 400, so logical flight dates and the one-day API request
+# padding are clamped to it. Future flights simply have no observation
+# available and remain unmatched.
 ARCHIVE_MIN_DATE = date(1940, 1, 1)
 ARCHIVE_MAX_DATE = date.today() - timedelta(days=1)
 
@@ -241,6 +242,11 @@ def _padded_request_dates(start_date, end_date):
     offset is GMT returns UTC-day boundaries even for a summer date. Padding
     guarantees the logical local days are present regardless of that offset;
     ``fetch_archive_weather`` then filters to the logical dates.
+
+    The padded bounds are clamped to the archive coverage window. The forward
+    pad is therefore applied only when the logical end is before
+    ``ARCHIVE_MAX_DATE``; requesting today's not-yet-archived date would make
+    the API reject the whole request with HTTP 400.
     """
     logical_start = _coerce_date(start_date)
     logical_end = _coerce_date(end_date)
@@ -248,7 +254,7 @@ def _padded_request_dates(start_date, end_date):
         logical_start - timedelta(days=1), ARCHIVE_MIN_DATE
     )
     request_end = min(
-        logical_end + timedelta(days=1), date.today()
+        logical_end + timedelta(days=1), ARCHIVE_MAX_DATE
     )
     return request_start, request_end
 
@@ -262,7 +268,8 @@ def fetch_archive_weather(airport_code, info, start_date, end_date):
     absolute UTC instants; the airport's IANA zone is used only for display
     and local-hour association.
 
-    The request is padded by one day on each side and the returned frame is
+    The request is padded by one day on each side where archive coverage
+    allows (clamped to ``ARCHIVE_MAX_DATE``) and the returned frame is
     filtered back to the logical local dates. This avoids request-time-offset
     boundary loss without shifting or fabricating timestamps.
     """
